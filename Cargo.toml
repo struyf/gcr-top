@@ -1,0 +1,27 @@
+[package]
+name = "gcr-top"
+version = "0.1.0"
+edition = "2024"
+authors = ["Matthias Struyf <matthias@rfc4301.dev>"]
+description = "A blazingly fast htop-like TUI monitor for Google Cloud Run services"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/struyf/gcr-top"
+keywords = ["gcp", "cloud-run", "tui", "cli", "monitoring"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# Terminal UI & Event handling
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+open = "5.3"
+
+# Asynchronous runtime & network
+tokio = { version = "1.38", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# CLI parsing & utility
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
