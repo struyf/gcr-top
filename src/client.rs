@@ -38,7 +38,10 @@ impl GcpClient {
         run_base_url: String,
         logging_base_url: String,
     ) -> Result<Self> {
-        let client = reqwest::Client::builder().build()?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(5))
+            .build()?;
 
         Ok(Self {
             client,
@@ -160,6 +163,12 @@ impl GcpClient {
                     err_text
                 );
             }
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                anyhow::bail!(
+                    "Google Cloud API rate limit exceeded (HTTP 429). Please retry shortly. Details: {}",
+                    err_text
+                );
+            }
             anyhow::bail!("API Error ({}): {}", status, err_text);
         }
 
@@ -201,6 +210,12 @@ impl GcpClient {
                     err
                 );
             }
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                anyhow::bail!(
+                    "Logging API rate limit exceeded (HTTP 429). Please retry shortly. Details: {}",
+                    err
+                );
+            }
             anyhow::bail!("Logging API Error ({}): {}", status, err);
         }
 
@@ -230,6 +245,12 @@ impl GcpClient {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 anyhow::bail!(
                     "Google Cloud authentication expired (HTTP 401). Please run 'gcloud auth login'. Details: {}",
+                    err_text
+                );
+            }
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                anyhow::bail!(
+                    "Revisions API rate limit exceeded (HTTP 429). Please retry shortly. Details: {}",
                     err_text
                 );
             }
@@ -281,6 +302,12 @@ impl GcpClient {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 anyhow::bail!(
                     "Google Cloud authentication expired (HTTP 401). Please run 'gcloud auth login'. Details: {}",
+                    err
+                );
+            }
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                anyhow::bail!(
+                    "Traffic split rate limit exceeded (HTTP 429). Please retry shortly. Details: {}",
                     err
                 );
             }
@@ -385,6 +412,31 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("gcloud auth login"));
+    }
+
+    #[tokio::test]
+    async fn test_list_services_rate_limited() {
+        let server = MockServer::start().await;
+        let client = GcpClient::with_base_urls(
+            "test-project".to_string(),
+            "us-central1".to_string(),
+            server.uri(),
+            server.uri(),
+        )
+        .unwrap()
+        .with_token("test-mock-token");
+
+        Mock::given(method("GET"))
+            .and(path("/v2/projects/test-project/locations/us-central1/services"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Rate limit exceeded"))
+            .mount(&server)
+            .await;
+
+        let result = client.list_services().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("429"));
+        assert!(err.contains("rate limit exceeded"));
     }
 
     #[tokio::test]
@@ -559,5 +611,32 @@ mod tests {
         let result = client.set_traffic_split("web", splits).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("400"));
+    }
+
+    #[tokio::test]
+    async fn test_set_traffic_split_rate_limited() {
+        let server = MockServer::start().await;
+        let client = GcpClient::with_base_urls(
+            "test-project".to_string(),
+            "us-central1".to_string(),
+            server.uri(),
+            server.uri(),
+        )
+        .unwrap()
+        .with_token("test-mock-token");
+
+        Mock::given(method("PATCH"))
+            .and(path("/v2/projects/test-project/locations/us-central1/services/web"))
+            .and(query_param("updateMask", "traffic"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Quota limit exceeded"))
+            .mount(&server)
+            .await;
+
+        let splits = vec![("web-00002-xyz", 100)];
+        let result = client.set_traffic_split("web", splits).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("429"));
+        assert!(err.contains("rate limit exceeded"));
     }
 }
