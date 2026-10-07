@@ -121,6 +121,15 @@ impl GcpClient {
         })
     }
 
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    #[allow(dead_code)]
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
     #[allow(dead_code)]
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token_cache = Arc::new(RwLock::new(Some(TokenCache {
@@ -269,11 +278,44 @@ impl GcpClient {
         Ok(entries)
     }
 
-    pub async fn list_revisions(&self, service_name: &str) -> Result<Vec<Revision>> {
+    pub async fn list_revisions(&self, service_name: &str, location: &str) -> Result<Vec<Revision>> {
+        let parts: Vec<&str> = service_name.split('/').collect();
+        let is_full_resource = parts.len() >= 6
+            && parts[0] == "projects"
+            && parts[2] == "locations"
+            && parts[4] == "services";
+
+        let proj = if is_full_resource {
+            parts[1]
+        } else {
+            &self.project_id
+        };
+
+        let loc = if !location.is_empty() && location != "-" {
+            location
+        } else if is_full_resource && parts[3] != "-" && !parts[3].is_empty() {
+            parts[3]
+        } else {
+            &self.region
+        };
+
+        if loc == "-" || loc.is_empty() {
+            anyhow::bail!(
+                "Cannot list revisions for service '{}': concrete location is required (aggregate region '-' cannot be used). Please specify a valid region.",
+                service_name
+            );
+        }
+
+        let clean_service_name = if is_full_resource {
+            parts[5]
+        } else {
+            service_name.rsplit('/').next().unwrap_or(service_name)
+        };
+
         let token = self.get_valid_token().await?;
         let url = format!(
             "{}/v2/projects/{}/locations/{}/services/{}/revisions",
-            self.run_base_url, self.project_id, self.region, service_name
+            self.run_base_url, proj, loc, clean_service_name
         );
 
         let resp = self
@@ -299,10 +341,34 @@ impl GcpClient {
         service_name: &str,
         splits: Vec<(&str, i32, Option<&str>)>, // (revision_id, percent, tag)
     ) -> Result<()> {
+        let parts: Vec<&str> = service_name.split('/').collect();
+        let is_full_resource = parts.len() >= 6
+            && parts[0] == "projects"
+            && parts[2] == "locations"
+            && parts[4] == "services";
+
+        let proj = if is_full_resource {
+            parts[1]
+        } else {
+            &self.project_id
+        };
+
+        let loc = if self.region == "-" && is_full_resource && parts[3] != "-" && !parts[3].is_empty() {
+            parts[3]
+        } else {
+            &self.region
+        };
+
+        let clean_service_name = if is_full_resource {
+            parts[5]
+        } else {
+            service_name.rsplit('/').next().unwrap_or(service_name)
+        };
+
         let token = self.get_valid_token().await?;
         let url = format!(
             "{}/v2/projects/{}/locations/{}/services/{}?updateMask=traffic",
-            self.run_base_url, self.project_id, self.region, service_name
+            self.run_base_url, proj, loc, clean_service_name
         );
 
         let traffic_array: Vec<serde_json::Value> = splits
@@ -569,10 +635,100 @@ mod tests {
             .mount(&server)
             .await;
 
-        let revisions = client.list_revisions("web").await.expect("Failed to fetch revisions");
+        let revisions = client.list_revisions("web", "us-central1").await.expect("Failed to fetch revisions");
         assert_eq!(revisions.len(), 2);
         assert_eq!(revisions[0].short_name(), "web-00002-xyz");
         assert_eq!(revisions[1].short_name(), "web-00001-abc");
+    }
+
+    #[tokio::test]
+    async fn test_list_revisions_with_aggregate_region_uses_concrete_location() {
+        let server = MockServer::start().await;
+        let client = GcpClient::with_base_urls(
+            "test-project".to_string(),
+            "-".to_string(), // Aggregate region
+            server.uri(),
+            server.uri(),
+        )
+        .unwrap()
+        .with_token("test-mock-token");
+
+        let response_json = serde_json::json!({
+            "revisions": [
+                {
+                    "name": "projects/test-project/locations/europe-west1/services/web/revisions/web-00001",
+                    "createTime": "2024-01-01T10:00:00Z"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/v2/projects/test-project/locations/europe-west1/services/web/revisions"))
+            .and(header("Authorization", "Bearer test-mock-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_json))
+            .mount(&server)
+            .await;
+
+        let revisions = client
+            .list_revisions("web", "europe-west1")
+            .await
+            .expect("Failed to fetch revisions");
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].short_name(), "web-00001");
+    }
+
+    #[tokio::test]
+    async fn test_list_revisions_with_full_resource_name() {
+        let server = MockServer::start().await;
+        let client = GcpClient::with_base_urls(
+            "default-proj".to_string(),
+            "-".to_string(),
+            server.uri(),
+            server.uri(),
+        )
+        .unwrap()
+        .with_token("test-mock-token");
+
+        let response_json = serde_json::json!({
+            "revisions": [
+                {
+                    "name": "projects/custom-proj/locations/asia-northeast1/services/api/revisions/api-00001",
+                    "createTime": "2024-01-01T10:00:00Z"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/v2/projects/custom-proj/locations/asia-northeast1/services/api/revisions"))
+            .and(header("Authorization", "Bearer test-mock-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_json))
+            .mount(&server)
+            .await;
+
+        let revisions = client
+            .list_revisions("projects/custom-proj/locations/asia-northeast1/services/api", "")
+            .await
+            .expect("Failed to fetch revisions");
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].short_name(), "api-00001");
+    }
+
+    #[tokio::test]
+    async fn test_list_revisions_missing_concrete_location_fails() {
+        let server = MockServer::start().await;
+        let client = GcpClient::with_base_urls(
+            "test-project".to_string(),
+            "-".to_string(),
+            server.uri(),
+            server.uri(),
+        )
+        .unwrap()
+        .with_token("test-mock-token");
+
+        let result = client.list_revisions("web", "-").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("concrete location is required"));
     }
 
     #[tokio::test]
@@ -593,7 +749,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = client.list_revisions("web").await;
+        let result = client.list_revisions("web", "us-central1").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("404"));
     }

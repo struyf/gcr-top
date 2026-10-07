@@ -203,13 +203,22 @@ impl AppState {
                                     });
                                 }
 
+                                // Retain any existing revisions that were not in fetched list
+                                for item in &modal.revisions {
+                                    if !items.iter().any(|i| i.revision_name == item.revision_name) {
+                                        items.push(item.clone());
+                                    }
+                                }
+
                                 let sum: i32 = items.iter().map(|i| i.percent).sum();
                                 if sum == 0 && !items.is_empty() {
                                     items[0].percent = 100;
                                 }
 
                                 modal.revisions = items;
-                                modal.selected_index = 0;
+                                if modal.selected_index >= modal.revisions.len() {
+                                    modal.selected_index = 0;
+                                }
                             }
                             modal.status = TrafficModalStatus::Idle;
                         }
@@ -219,6 +228,10 @@ impl AppState {
                                     "Failed to list revisions: {}",
                                     err
                                 ));
+                                self.add_toast(
+                                    format!("Failed to list revisions: {}", err),
+                                    ToastKind::Error,
+                                );
                             } else {
                                 modal.status = TrafficModalStatus::Idle;
                                 self.banner_message = Some((
@@ -335,9 +348,14 @@ fn spawn_fetch_logs(client: Arc<client::GcpClient>, tx: mpsc::Sender<AppEvent>, 
     });
 }
 
-fn spawn_fetch_revisions(client: Arc<client::GcpClient>, tx: mpsc::Sender<AppEvent>, service_name: String) {
+fn spawn_fetch_revisions(
+    client: Arc<client::GcpClient>,
+    tx: mpsc::Sender<AppEvent>,
+    service_name: String,
+    location: String,
+) {
     tokio::spawn(async move {
-        match client.list_revisions(&service_name).await {
+        match client.list_revisions(&service_name, &location).await {
             Ok(revs) => {
                 let _ = tx.send(AppEvent::RevisionsFetched {
                     service_name,
@@ -397,6 +415,9 @@ fn open_traffic_modal(
     let primary = svc.primary_revision();
     let details = svc.traffic_details();
     for (i, (rev, pct, tag)) in details.into_iter().enumerate() {
+        if rev == "-" {
+            continue;
+        }
         let is_latest = (rev == primary) || (i == 0);
         modal.revisions.push(RevisionTrafficItem {
             revision_name: rev,
@@ -406,7 +427,19 @@ fn open_traffic_modal(
         });
     }
 
-    spawn_fetch_revisions(Arc::clone(client), tx.clone(), svc_name);
+    let location = svc
+        .concrete_location()
+        .unwrap_or_else(|| {
+            let reg = client.region();
+            if reg != "-" {
+                reg
+            } else {
+                ""
+            }
+        })
+        .to_string();
+
+    spawn_fetch_revisions(Arc::clone(client), tx.clone(), svc_name, location);
     Some(modal)
 }
 
@@ -548,7 +581,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     } else {
                         app_state.add_toast("No service selected", ToastKind::Info);
                         app_state.banner_message = Some((
-                            "No service selected".to_string(),
+                            "No service selected to adjust traffic split".to_string(),
                             BannerType::Info,
                             std::time::Instant::now(),
                         ));
@@ -753,6 +786,52 @@ mod tests {
         assert_eq!(modal.revisions[1].percent, 0);
         assert!(!modal.revisions[1].is_latest);
         assert_eq!(modal.selected_index, 0);
+    }
+
+    #[test]
+    fn test_revisions_fetched_populates_zero_percent_traffic_revisions() {
+        let mut state = AppState::new();
+        let mut modal = TrafficModalState::new("web-service".to_string());
+        modal.revisions.push(RevisionTrafficItem {
+            revision_name: "rev-001".to_string(),
+            percent: 100,
+            tag: "active".to_string(),
+            is_latest: false,
+        });
+        modal.status = TrafficModalStatus::FetchingRevisions;
+        state.traffic_modal = Some(modal);
+
+        let revs = vec![
+            Revision {
+                name: "projects/p/locations/l/services/web-service/revisions/rev-002".to_string(),
+                conditions: None,
+                create_time: None,
+            },
+            Revision {
+                name: "projects/p/locations/l/services/web-service/revisions/rev-001".to_string(),
+                conditions: None,
+                create_time: None,
+            },
+        ];
+
+        let action = state.handle_event(AppEvent::RevisionsFetched {
+            service_name: "web-service".to_string(),
+            result: Ok(revs),
+        });
+        assert_eq!(action, AppAction::None);
+
+        let modal = state.traffic_modal.unwrap();
+        assert_eq!(modal.status, TrafficModalStatus::Idle);
+        assert_eq!(modal.revisions.len(), 2);
+        // rev-002 is latest fetched, gets 0% traffic since it had no prior split
+        assert_eq!(modal.revisions[0].revision_name, "rev-002");
+        assert_eq!(modal.revisions[0].percent, 0);
+        assert!(modal.revisions[0].is_latest);
+        // rev-001 retains its active 100% split and tag
+        assert_eq!(modal.revisions[1].revision_name, "rev-001");
+        assert_eq!(modal.revisions[1].percent, 100);
+        assert_eq!(modal.revisions[1].tag, "active");
+        assert_eq!(modal.total_percent(), 100);
     }
 
     #[test]
@@ -983,6 +1062,106 @@ mod tests {
             other => panic!("Expected Success status, got {:?}", other),
         }
         assert!(app_state.toasts.iter().any(|t| t.kind == ToastKind::Success));
+    }
+
+    #[tokio::test]
+    async fn test_mock_integration_aggregate_region_fetches_revisions_with_concrete_location() {
+        let server = wiremock::MockServer::start().await;
+        // Client configured with aggregate region "-"
+        let client = Arc::new(
+            client::GcpClient::with_base_urls(
+                "test-project".to_string(),
+                "-".to_string(),
+                server.uri(),
+                server.uri(),
+            )
+            .unwrap()
+            .with_token("test-mock-token"),
+        );
+
+        // Mock list_revisions on the concrete location europe-west1
+        let revs_response = serde_json::json!({
+            "revisions": [
+                {
+                    "name": "projects/test-project/locations/europe-west1/services/api/revisions/api-00002",
+                    "createTime": "2024-01-02T00:00:00Z"
+                },
+                {
+                    "name": "projects/test-project/locations/europe-west1/services/api/revisions/api-00001",
+                    "createTime": "2024-01-01T00:00:00Z"
+                }
+            ]
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/projects/test-project/locations/europe-west1/services/api/revisions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(revs_response))
+            .mount(&server)
+            .await;
+
+        let mut app_state = AppState::new();
+        app_state.services = vec![Service {
+            name: "projects/test-project/locations/europe-west1/services/api".to_string(),
+            uri: Some("https://api.run.app".to_string()),
+            latest_ready_revision: Some("api-00002".to_string()),
+            conditions: None,
+            traffic_statuses: None,
+        }];
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let modal = open_traffic_modal(&app_state.services, &app_state.table_state, &client, &tx).unwrap();
+        app_state.traffic_modal = Some(modal);
+        assert_eq!(app_state.traffic_modal.as_ref().unwrap().status, TrafficModalStatus::FetchingRevisions);
+
+        let event = rx.recv().await.expect("Expected RevisionsFetched event");
+        let action = app_state.handle_event(event);
+        assert_eq!(action, AppAction::None);
+
+        let modal = app_state.traffic_modal.as_ref().unwrap();
+        assert_eq!(modal.status, TrafficModalStatus::Idle);
+        assert_eq!(modal.revisions.len(), 2);
+        assert_eq!(modal.revisions[0].revision_name, "api-00002");
+        assert_eq!(modal.revisions[1].revision_name, "api-00001");
+    }
+
+    #[tokio::test]
+    async fn test_mock_integration_aggregate_region_malformed_service_name_emits_error() {
+        let server = wiremock::MockServer::start().await;
+        let client = Arc::new(
+            client::GcpClient::with_base_urls(
+                "test-project".to_string(),
+                "-".to_string(),
+                server.uri(),
+                server.uri(),
+            )
+            .unwrap()
+            .with_token("test-mock-token"),
+        );
+
+        let mut app_state = AppState::new();
+        app_state.services = vec![Service {
+            name: "malformed-name".to_string(),
+            uri: None,
+            latest_ready_revision: None,
+            conditions: None,
+            traffic_statuses: None,
+        }];
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let modal = open_traffic_modal(&app_state.services, &app_state.table_state, &client, &tx).unwrap();
+        app_state.traffic_modal = Some(modal);
+
+        let event = rx.recv().await.expect("Expected RevisionsFetched event");
+        let action = app_state.handle_event(event);
+        assert_eq!(action, AppAction::None);
+
+        let modal = app_state.traffic_modal.as_ref().unwrap();
+        match &modal.status {
+            TrafficModalStatus::Error(err) => {
+                assert!(err.contains("concrete location is required"));
+            }
+            other => panic!("Expected Error status, got {:?}", other),
+        }
     }
 
     #[tokio::test]

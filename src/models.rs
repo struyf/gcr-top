@@ -21,6 +21,25 @@ impl Service {
         self.name.rsplit('/').next().unwrap_or(&self.name)
     }
 
+    /// Extracts the location from the resource name:
+    /// `projects/{project}/locations/{location}/services/{service}`.
+    /// Returns None if the name is malformed or location is empty.
+    pub fn location(&self) -> Option<&str> {
+        let parts: Vec<&str> = self.name.split('/').collect();
+        if let Some(pos) = parts.iter().position(|&p| p == "locations") {
+            parts.get(pos + 1).copied().filter(|loc| !loc.is_empty())
+        } else if parts.len() >= 4 && parts[0] == "projects" {
+            parts.get(3).copied().filter(|loc| !loc.is_empty())
+        } else {
+            None
+        }
+    }
+
+    /// Extracts the concrete location, ensuring it is not the wildcard `"-"`.
+    pub fn concrete_location(&self) -> Option<&str> {
+        self.location().filter(|loc| *loc != "-")
+    }
+
     pub fn is_ready(&self) -> bool {
         if let Some(ref conditions) = self.conditions {
             conditions.iter().any(|c| c.state.as_deref() == Some("CONDITION_SUCCEEDED"))
@@ -188,6 +207,62 @@ impl LogEntry {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_service_location_extraction() {
+        let svc_std = Service {
+            name: "projects/my-project/locations/us-central1/services/my-service".to_string(),
+            uri: None,
+            latest_ready_revision: None,
+            conditions: None,
+            traffic_statuses: None,
+        };
+        assert_eq!(svc_std.location(), Some("us-central1"));
+        assert_eq!(svc_std.concrete_location(), Some("us-central1"));
+
+        let svc_europe = Service {
+            name: "projects/my-project/locations/europe-west1/services/api".to_string(),
+            uri: None,
+            latest_ready_revision: None,
+            conditions: None,
+            traffic_statuses: None,
+        };
+        assert_eq!(svc_europe.location(), Some("europe-west1"));
+        assert_eq!(svc_europe.concrete_location(), Some("europe-west1"));
+
+        // Aggregate wildcard "-"
+        let svc_wildcard = Service {
+            name: "projects/my-project/locations/-/services/wildcard-svc".to_string(),
+            uri: None,
+            latest_ready_revision: None,
+            conditions: None,
+            traffic_statuses: None,
+        };
+        assert_eq!(svc_wildcard.location(), Some("-"));
+        assert_eq!(svc_wildcard.concrete_location(), None);
+
+        // Malformed or short name
+        let svc_short = Service {
+            name: "my-service".to_string(),
+            uri: None,
+            latest_ready_revision: None,
+            conditions: None,
+            traffic_statuses: None,
+        };
+        assert_eq!(svc_short.location(), None);
+        assert_eq!(svc_short.concrete_location(), None);
+
+        // Empty location part
+        let svc_empty_loc = Service {
+            name: "projects/my-project/locations//services/my-service".to_string(),
+            uri: None,
+            latest_ready_revision: None,
+            conditions: None,
+            traffic_statuses: None,
+        };
+        assert_eq!(svc_empty_loc.location(), None);
+        assert_eq!(svc_empty_loc.concrete_location(), None);
+    }
 
     #[test]
     fn test_traffic_summary_single_or_empty() {
