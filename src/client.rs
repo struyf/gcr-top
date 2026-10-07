@@ -8,6 +8,74 @@ use crate::models::{
     LogEntriesResponse, LogEntry, Revision, RevisionListResponse, Service, ServiceListResponse,
 };
 
+pub fn format_actionable_error(status: reqwest::StatusCode, action: &str, raw_body: &str) -> String {
+    let parsed_message = serde_json::from_str::<serde_json::Value>(raw_body)
+        .ok()
+        .and_then(|val| {
+            val.get("error")
+                .and_then(|err| err.get("message"))
+                .and_then(|msg| msg.as_str())
+                .map(|s| s.to_string())
+        });
+
+    let details = parsed_message.unwrap_or_else(|| {
+        let trimmed = raw_body.trim();
+        if trimmed.is_empty() {
+            "No additional details provided by API.".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    });
+
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED => {
+            format!(
+                "Google Cloud authentication expired (HTTP 401). Please run 'gcloud auth login' to authenticate. Details: {}",
+                details
+            )
+        }
+        reqwest::StatusCode::FORBIDDEN => {
+            format!(
+                "Permission Denied (HTTP 403). Please ensure your active GCP account has the 'Cloud Run Developer' (roles/run.developer) or 'Cloud Run Admin' role. Details: {}",
+                details
+            )
+        }
+        reqwest::StatusCode::NOT_FOUND => {
+            format!(
+                "Resource not found (HTTP 404). The service or revision does not exist or may have been deleted. Details: {}",
+                details
+            )
+        }
+        reqwest::StatusCode::CONFLICT => {
+            format!(
+                "Conflict detected (HTTP 409). The service configuration was modified concurrently. Please refresh [r] and retry. Details: {}",
+                details
+            )
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            format!(
+                "Google Cloud API rate limit exceeded (HTTP 429). Please retry shortly. Details: {}",
+                details
+            )
+        }
+        reqwest::StatusCode::BAD_REQUEST => {
+            format!(
+                "Invalid request (HTTP 400). Please check your configuration parameters. Details: {}",
+                details
+            )
+        }
+        s if s.is_server_error() => {
+            format!(
+                "Google Cloud service temporarily unavailable (HTTP {}). Please check GCP status and retry. Details: {}",
+                s, details
+            )
+        }
+        _ => {
+            format!("Failed to {} (HTTP {}): {}", action, status, details)
+        }
+    }
+}
+
 struct TokenCache {
     token: String,
     fetched_at: Instant,
@@ -157,19 +225,7 @@ impl GcpClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let err_text = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                anyhow::bail!(
-                    "Google Cloud authentication expired (HTTP 401). Please run 'gcloud auth login'. Details: {}",
-                    err_text
-                );
-            }
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                anyhow::bail!(
-                    "Google Cloud API rate limit exceeded (HTTP 429). Please retry shortly. Details: {}",
-                    err_text
-                );
-            }
-            anyhow::bail!("API Error ({}): {}", status, err_text);
+            anyhow::bail!(format_actionable_error(status, "list services", &err_text));
         }
 
         let parsed: ServiceListResponse = resp.json().await?;
@@ -204,19 +260,7 @@ impl GcpClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                anyhow::bail!(
-                    "Google Cloud authentication expired (HTTP 401). Please run 'gcloud auth login'. Details: {}",
-                    err
-                );
-            }
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                anyhow::bail!(
-                    "Logging API rate limit exceeded (HTTP 429). Please retry shortly. Details: {}",
-                    err
-                );
-            }
-            anyhow::bail!("Logging API Error ({}): {}", status, err);
+            anyhow::bail!(format_actionable_error(status, "fetch logs", &err));
         }
 
         let parsed: LogEntriesResponse = resp.json().await?;
@@ -242,30 +286,18 @@ impl GcpClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let err_text = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                anyhow::bail!(
-                    "Google Cloud authentication expired (HTTP 401). Please run 'gcloud auth login'. Details: {}",
-                    err_text
-                );
-            }
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                anyhow::bail!(
-                    "Revisions API rate limit exceeded (HTTP 429). Please retry shortly. Details: {}",
-                    err_text
-                );
-            }
-            anyhow::bail!("Revisions API Error ({}): {}", status, err_text);
+            anyhow::bail!(format_actionable_error(status, "list revisions", &err_text));
         }
 
         let parsed: RevisionListResponse = resp.json().await?;
         Ok(parsed.revisions.unwrap_or_default())
     }
 
-    /// Update traffic split allocation via Cloud Run Admin v2 API
-    pub async fn set_traffic_split(
+    /// Update traffic split allocation with optional revision tags via Cloud Run Admin v2 API
+    pub async fn set_traffic_split_with_tags(
         &self,
         service_name: &str,
-        splits: Vec<(&str, i32)>, // (revision_id, percent)
+        splits: Vec<(&str, i32, Option<&str>)>, // (revision_id, percent, tag)
     ) -> Result<()> {
         let token = self.get_valid_token().await?;
         let url = format!(
@@ -275,12 +307,16 @@ impl GcpClient {
 
         let traffic_array: Vec<serde_json::Value> = splits
             .into_iter()
-            .map(|(rev, pct)| {
-                serde_json::json!({
+            .map(|(rev, pct, tag)| {
+                let mut item = serde_json::json!({
                     "revision": rev,
                     "percent": pct,
                     "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION"
-                })
+                });
+                if let Some(t) = tag.filter(|t| !t.trim().is_empty() && *t != "-") {
+                    item["tag"] = serde_json::Value::String(t.trim().to_string());
+                }
+                item
             })
             .collect();
 
@@ -299,22 +335,21 @@ impl GcpClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                anyhow::bail!(
-                    "Google Cloud authentication expired (HTTP 401). Please run 'gcloud auth login'. Details: {}",
-                    err
-                );
-            }
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                anyhow::bail!(
-                    "Traffic split rate limit exceeded (HTTP 429). Please retry shortly. Details: {}",
-                    err
-                );
-            }
-            anyhow::bail!("Failed to update traffic ({}): {}", status, err);
+            anyhow::bail!(format_actionable_error(status, "update traffic split", &err));
         }
 
         Ok(())
+    }
+
+    /// Update traffic split allocation via Cloud Run Admin v2 API
+    #[allow(dead_code)]
+    pub async fn set_traffic_split(
+        &self,
+        service_name: &str,
+        splits: Vec<(&str, i32)>, // (revision_id, percent)
+    ) -> Result<()> {
+        let with_tags = splits.into_iter().map(|(rev, pct)| (rev, pct, None)).collect();
+        self.set_traffic_split_with_tags(service_name, with_tags).await
     }
 }
 
@@ -589,6 +624,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_set_traffic_split_with_tags_success() {
+        let server = MockServer::start().await;
+        let client = GcpClient::with_base_urls(
+            "test-project".to_string(),
+            "us-central1".to_string(),
+            server.uri(),
+            server.uri(),
+        )
+        .unwrap()
+        .with_token("test-mock-token");
+
+        Mock::given(method("PATCH"))
+            .and(path("/v2/projects/test-project/locations/us-central1/services/web"))
+            .and(query_param("updateMask", "traffic"))
+            .and(header("Authorization", "Bearer test-mock-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let splits = vec![
+            ("web-00002-xyz", 80, Some("candidate")),
+            ("web-00001-abc", 20, None),
+        ];
+        let result = client.set_traffic_split_with_tags("web", splits).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn test_set_traffic_split_error() {
         let server = MockServer::start().await;
         let client = GcpClient::with_base_urls(
@@ -638,5 +701,82 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("429"));
         assert!(err.contains("rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn test_set_traffic_split_permission_denied_403() {
+        let server = MockServer::start().await;
+        let client = GcpClient::with_base_urls(
+            "test-project".to_string(),
+            "us-central1".to_string(),
+            server.uri(),
+            server.uri(),
+        )
+        .unwrap()
+        .with_token("test-mock-token");
+
+        Mock::given(method("PATCH"))
+            .and(path("/v2/projects/test-project/locations/us-central1/services/web"))
+            .and(query_param("updateMask", "traffic"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 403,
+                    "message": "The caller does not have permission 'run.services.update'",
+                    "status": "PERMISSION_DENIED"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let splits = vec![("web-00002-xyz", 100)];
+        let result = client.set_traffic_split("web", splits).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Permission Denied"));
+        assert!(err.contains("Cloud Run Developer"));
+    }
+
+    #[tokio::test]
+    async fn test_set_traffic_split_conflict_409() {
+        let server = MockServer::start().await;
+        let client = GcpClient::with_base_urls(
+            "test-project".to_string(),
+            "us-central1".to_string(),
+            server.uri(),
+            server.uri(),
+        )
+        .unwrap()
+        .with_token("test-mock-token");
+
+        Mock::given(method("PATCH"))
+            .and(path("/v2/projects/test-project/locations/us-central1/services/web"))
+            .and(query_param("updateMask", "traffic"))
+            .respond_with(ResponseTemplate::new(409).set_body_string("Resource version mismatch"))
+            .mount(&server)
+            .await;
+
+        let splits = vec![("web-00002-xyz", 100)];
+        let result = client.set_traffic_split("web", splits).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("409"));
+        assert!(err.contains("Conflict detected"));
+    }
+
+    #[test]
+    fn test_format_actionable_error_json_unpacking() {
+        let raw_json = serde_json::json!({
+            "error": {
+                "code": 403,
+                "message": "Caller lacks run.services.update permission",
+                "status": "PERMISSION_DENIED"
+            }
+        })
+        .to_string();
+
+        let err_msg = format_actionable_error(reqwest::StatusCode::FORBIDDEN, "update traffic", &raw_json);
+        assert!(err_msg.contains("Permission Denied"));
+        assert!(err_msg.contains("Cloud Run Developer"));
+        assert!(err_msg.contains("Caller lacks run.services.update permission"));
     }
 }

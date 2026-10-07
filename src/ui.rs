@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
     Frame,
 };
+use std::time::Duration;
 
 use crate::models::{LogEntry, Service};
 
@@ -13,6 +14,15 @@ pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 
 pub fn spinner(tick: usize) -> &'static str {
     SPINNER_FRAMES[tick % SPINNER_FRAMES.len()]
+}
+
+pub fn animated_dots(tick: usize) -> &'static str {
+    match (tick / 2) % 4 {
+        0 => "",
+        1 => ".",
+        2 => "..",
+        _ => "...",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,10 +33,80 @@ pub enum BannerType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToastKind {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub message: String,
+    pub kind: ToastKind,
+    pub created_at: std::time::Instant,
+    pub duration: Duration,
+}
+
+impl Toast {
+    pub fn new(message: impl Into<String>, kind: ToastKind) -> Self {
+        let duration = match kind {
+            ToastKind::Error => Duration::from_secs(8),
+            ToastKind::Warning => Duration::from_secs(6),
+            ToastKind::Info | ToastKind::Success => Duration::from_secs(4),
+        };
+        Self {
+            message: message.into(),
+            kind,
+            created_at: std::time::Instant::now(),
+            duration,
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.created_at.elapsed() > self.duration
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevisionTrafficItem {
     pub revision_name: String,
     pub percent: i32,
     pub tag: String,
+    pub is_latest: bool,
+}
+
+impl RevisionTrafficItem {
+    pub fn new(name: impl Into<String>, percent: i32, tag: impl Into<String>) -> Self {
+        Self {
+            revision_name: name.into(),
+            percent,
+            tag: tag.into(),
+            is_latest: false,
+        }
+    }
+
+    pub fn with_latest(mut self, is_latest: bool) -> Self {
+        self.is_latest = is_latest;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrafficSplitTarget {
+    pub revision: String,
+    pub percent: i32,
+    pub tag: Option<String>,
+}
+
+impl TrafficSplitTarget {
+    pub fn new(revision: impl Into<String>, percent: i32, tag: Option<String>) -> Self {
+        Self {
+            revision: revision.into(),
+            percent,
+            tag,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +123,7 @@ pub enum TrafficModalStatus {
 pub enum TrafficModalAction {
     None,
     Close,
-    Submit(Vec<(String, i32)>),
+    Submit(Vec<TrafficSplitTarget>),
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +133,8 @@ pub struct TrafficModalState {
     pub selected_index: usize,
     pub input_buffer: String,
     pub status: TrafficModalStatus,
+    pub editing_tag: bool,
+    pub tag_input_buffer: String,
 }
 
 impl TrafficModalState {
@@ -63,6 +145,8 @@ impl TrafficModalState {
             selected_index: 0,
             input_buffer: String::new(),
             status: TrafficModalStatus::FetchingRevisions,
+            editing_tag: false,
+            tag_input_buffer: String::new(),
         }
     }
 
@@ -70,10 +154,63 @@ impl TrafficModalState {
         self.revisions.iter().map(|r| r.percent).sum()
     }
 
+    pub fn is_latest_zero_traffic(&self) -> bool {
+        let latest = self
+            .revisions
+            .iter()
+            .find(|r| r.is_latest)
+            .or_else(|| self.revisions.first());
+        if let Some(item) = latest {
+            item.percent == 0
+        } else {
+            false
+        }
+    }
+
+    pub fn latest_revision_name(&self) -> Option<&str> {
+        self.revisions
+            .iter()
+            .find(|r| r.is_latest)
+            .or_else(|| self.revisions.first())
+            .map(|r| r.revision_name.as_str())
+    }
+
     pub fn handle_key(&mut self, key: KeyCode) -> TrafficModalAction {
         if matches!(self.status, TrafficModalStatus::Submitting | TrafficModalStatus::FetchingRevisions) {
             if key == KeyCode::Esc {
                 return TrafficModalAction::Close;
+            }
+            return TrafficModalAction::None;
+        }
+
+        if self.editing_tag {
+            match key {
+                KeyCode::Esc => {
+                    self.editing_tag = false;
+                    self.tag_input_buffer.clear();
+                }
+                KeyCode::Enter => {
+                    if let Some(item) = self.revisions.get_mut(self.selected_index) {
+                        let trimmed = self.tag_input_buffer.trim();
+                        item.tag = if trimmed.is_empty() || trimmed == "-" {
+                            "-".to_string()
+                        } else {
+                            trimmed.to_string()
+                        };
+                    }
+                    self.editing_tag = false;
+                    self.tag_input_buffer.clear();
+                }
+                KeyCode::Backspace => {
+                    self.tag_input_buffer.pop();
+                }
+                KeyCode::Char(c)
+                    if (c.is_ascii_alphanumeric() || c == '-')
+                        && self.tag_input_buffer.len() < 63 =>
+                {
+                    self.tag_input_buffer.push(c);
+                }
+                _ => {}
             }
             return TrafficModalAction::None;
         }
@@ -102,11 +239,18 @@ impl TrafficModalState {
                         TrafficModalAction::None
                     } else {
                         self.status = TrafficModalStatus::Submitting;
-                        let splits: Vec<(String, i32)> = self
+                        let splits: Vec<TrafficSplitTarget> = self
                             .revisions
                             .iter()
                             .filter(|r| r.percent > 0)
-                            .map(|r| (r.revision_name.clone(), r.percent))
+                            .map(|r| {
+                                let tag = if r.tag.is_empty() || r.tag == "-" {
+                                    None
+                                } else {
+                                    Some(r.tag.clone())
+                                };
+                                TrafficSplitTarget::new(r.revision_name.clone(), r.percent, tag)
+                            })
                             .collect();
                         TrafficModalAction::Submit(splits)
                     }
@@ -125,6 +269,19 @@ impl TrafficModalState {
                     }
                 }
             },
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                if !self.revisions.is_empty() {
+                    self.reset_confirm_or_error();
+                    self.editing_tag = true;
+                    let current_tag = &self.revisions[self.selected_index].tag;
+                    self.tag_input_buffer = if current_tag == "-" {
+                        String::new()
+                    } else {
+                        current_tag.clone()
+                    };
+                }
+                TrafficModalAction::None
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.status == TrafficModalStatus::Confirming {
                     self.status = TrafficModalStatus::Idle;
@@ -265,10 +422,13 @@ pub struct UiState<'a> {
     pub log_error_msg: Option<&'a str>,
     pub banner_message: Option<(&'a str, &'a BannerType)>,
     pub traffic_modal: Option<&'a TrafficModalState>,
+    pub toasts: &'a [Toast],
     pub spinner_tick: usize,
 }
 
 pub fn render_ui(f: &mut Frame, state: UiState) {
+    let dots = animated_dots(state.spinner_tick);
+
     // If services are empty and there is an error, show the startup error screen
     if state.services.is_empty()
         && let Some(err) = state.services_error {
@@ -330,7 +490,7 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
     chunk_idx += 1;
 
     let fetching_indicator = if state.is_fetching_services {
-        format!(" [ {} Fetching services... ]", spinner(state.spinner_tick))
+        format!(" [ {} Fetching services{} ]", spinner(state.spinner_tick), dots)
     } else {
         String::new()
     };
@@ -393,7 +553,7 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
         .collect();
 
     let table_title = if state.is_fetching_services {
-        format!(" Services [ {} Fetching... ] ", spinner(state.spinner_tick))
+        format!(" Services [ {} Fetching{} ] ", spinner(state.spinner_tick), dots)
     } else {
         format!(" Services ({}) ", state.services.len())
     };
@@ -435,7 +595,7 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
             .wrap(Wrap { trim: true })
             .block(Block::default().borders(Borders::ALL).title(" Error ").border_style(Style::default().fg(Color::Red)))
         } else if state.is_fetching_logs && state.logs.is_empty() {
-            Paragraph::new(format!(" {} Streaming logs from Cloud Logging...", spinner(state.spinner_tick)))
+            Paragraph::new(format!(" {} Streaming logs from Cloud Logging{} ", spinner(state.spinner_tick), dots))
                 .style(Style::default().fg(Color::Yellow))
                 .block(Block::default().borders(Borders::ALL).title(format!(" Logs: {} ", state.selected_service_name)))
         } else if state.logs.is_empty() {
@@ -473,9 +633,10 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
 
             let title = if state.is_fetching_logs {
                 format!(
-                    " Live Logs: {} [ {} Refreshing... ] ",
+                    " Live Logs: {} [ {} Refreshing{} ] ",
                     state.selected_service_name,
-                    spinner(state.spinner_tick)
+                    spinner(state.spinner_tick),
+                    dots
                 )
             } else {
                 format!(
@@ -523,10 +684,12 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
     // 4. Footer
     let footer_chunk = chunks[chunk_idx];
     let footer_text = if let Some(modal) = state.traffic_modal {
-        if modal.status == TrafficModalStatus::Confirming {
+        if modal.editing_tag {
+            " [Enter]: Save tag | [Esc]: Cancel tag edit | Type a-z, 0-9, hyphen "
+        } else if modal.status == TrafficModalStatus::Confirming {
             " [Enter]: Confirm traffic deployment | [Esc] / arrows: Cancel confirmation "
         } else {
-            " [↑/↓]: Select Revision | [0-9]: Enter % | [←/→] or [+/-]: Adjust | [c]: Clear | [C]: Clear all | [Enter]: Confirm | [Esc]: Cancel "
+            " [↑/↓]: Select Revision | [0-9]: Enter % | [←/→] or [+/-]: Adjust | [t]: Edit Tag | [c]: Clear | [C]: Clear all | [Enter]: Confirm | [Esc]: Cancel "
         }
     } else if state.show_logs {
         " [Esc]: Close Logs | [j/k]: Select Service | [s]: Traffic Split | [o]: Open URL | [q]: Quit "
@@ -543,16 +706,111 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
     if let Some(modal) = state.traffic_modal {
         render_traffic_modal(f, modal, state.spinner_tick);
     }
+
+    // 6. Global Floating Toast Notifications
+    render_toasts(f, state.toasts);
+}
+
+pub fn render_toasts(f: &mut Frame, toasts: &[Toast]) {
+    if toasts.is_empty() {
+        return;
+    }
+    let area = f.area();
+    let toast_width = 46.min(area.width.saturating_sub(4));
+    let mut top_y = 1u16;
+
+    for toast in toasts.iter().rev().take(3) {
+        let toast_height = 3u16;
+        if top_y + toast_height >= area.height.saturating_sub(3) {
+            break;
+        }
+        let toast_area = Rect {
+            x: area.width.saturating_sub(toast_width + 2),
+            y: top_y,
+            width: toast_width,
+            height: toast_height,
+        };
+
+        let (border_color, icon) = match toast.kind {
+            ToastKind::Error => (Color::Red, "✗ Error: "),
+            ToastKind::Warning => (Color::Yellow, "⚠ Warning: "),
+            ToastKind::Success => (Color::Green, "✓ Success: "),
+            ToastKind::Info => (Color::Cyan, "ℹ Info: "),
+        };
+
+        f.render_widget(Clear, toast_area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(format!(" {} ", icon.trim()));
+
+        let text = Paragraph::new(toast.message.as_str())
+            .style(Style::default().fg(Color::White))
+            .wrap(Wrap { trim: true })
+            .block(block);
+
+        f.render_widget(text, toast_area);
+        top_y += toast_height;
+    }
 }
 
 pub fn render_traffic_modal(f: &mut Frame, modal: &TrafficModalState, tick: usize) {
-    let area = centered_rect(72, 70, f.area());
+    let area = centered_rect(75, 75, f.area());
     f.render_widget(Clear, area);
+
+    let dots = animated_dots(tick);
+    let total = modal.total_percent();
+
+    let border_color = match &modal.status {
+        TrafficModalStatus::Submitting => Color::Cyan,
+        TrafficModalStatus::FetchingRevisions => Color::Yellow,
+        TrafficModalStatus::Success(_) => Color::Green,
+        TrafficModalStatus::Error(_) => Color::Red,
+        TrafficModalStatus::Confirming => {
+            if modal.is_latest_zero_traffic() {
+                Color::Yellow
+            } else {
+                Color::Green
+            }
+        }
+        TrafficModalStatus::Idle => {
+            if total == 100 {
+                Color::Green
+            } else {
+                Color::Red
+            }
+        }
+    };
+
+    let modal_title = match &modal.status {
+        TrafficModalStatus::FetchingRevisions => {
+            format!(" Traffic Split Allocation: {} [ {} Fetching revisions{} ] ", modal.service_name, spinner(tick), dots)
+        }
+        TrafficModalStatus::Submitting => {
+            format!(" Traffic Split Allocation: {} [ {} Submitting{} ] ", modal.service_name, spinner(tick), dots)
+        }
+        TrafficModalStatus::Success(_) => {
+            format!(" Traffic Split Allocation: {} [ ✓ Updated ] ", modal.service_name)
+        }
+        TrafficModalStatus::Error(_) => {
+            format!(" Traffic Split Allocation: {} [ ✗ Error ] ", modal.service_name)
+        }
+        TrafficModalStatus::Confirming => {
+            format!(" Traffic Split Allocation: {} [ ⚠ Confirmation Pending ] ", modal.service_name)
+        }
+        TrafficModalStatus::Idle => {
+            if total == 100 {
+                format!(" Traffic Split Allocation: {} [ 100/100% Valid ] ", modal.service_name)
+            } else {
+                format!(" Traffic Split Allocation: {} [ {}/100% ] ", modal.service_name, total)
+            }
+        }
+    };
 
     let modal_block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" Traffic Split Allocation: {} ", modal.service_name))
-        .border_style(Style::default().fg(Color::Cyan));
+        .title(modal_title)
+        .border_style(Style::default().fg(border_color));
 
     let inner_area = modal_block.inner(area);
     f.render_widget(modal_block, area);
@@ -562,7 +820,7 @@ pub fn render_traffic_modal(f: &mut Frame, modal: &TrafficModalState, tick: usiz
         .constraints([
             Constraint::Length(2), // Top description
             Constraint::Min(5),    // Revisions list
-            Constraint::Length(2), // Total / Sum validation
+            Constraint::Length(3), // Visual Total Allocation Indicator & Validation
             Constraint::Length(3), // Status / error message (supports text wrapping)
             Constraint::Length(2), // Navigation hint
         ])
@@ -582,7 +840,7 @@ pub fn render_traffic_modal(f: &mut Frame, modal: &TrafficModalState, tick: usiz
         if modal.status == TrafficModalStatus::FetchingRevisions {
             vec![Row::new(vec![
                 Cell::from(""),
-                Cell::from(format!("{} Fetching revisions from Cloud Run API...", spinner(tick))),
+                Cell::from(format!("{} Fetching revisions from Cloud Run API{} please wait", spinner(tick), dots)),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
@@ -617,8 +875,16 @@ pub fn render_traffic_modal(f: &mut Frame, modal: &TrafficModalState, tick: usiz
                     Color::DarkGray
                 };
 
+                let rev_display = if item.is_latest {
+                    format!("{} [latest]", item.revision_name)
+                } else {
+                    item.revision_name.clone()
+                };
+
                 let rev_style = if is_selected {
                     Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                } else if item.is_latest {
+                    Style::default().fg(Color::Cyan)
                 } else {
                     Style::default().fg(Color::Gray)
                 };
@@ -645,12 +911,28 @@ pub fn render_traffic_modal(f: &mut Frame, modal: &TrafficModalState, tick: usiz
                     Style::default()
                 };
 
+                let tag_display = if is_selected && modal.editing_tag {
+                    format!("[ {}_ ]", modal.tag_input_buffer)
+                } else if item.tag.is_empty() || item.tag == "-" {
+                    "-".to_string()
+                } else {
+                    item.tag.clone()
+                };
+
+                let tag_style = if is_selected && modal.editing_tag {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else if item.tag != "-" && !item.tag.is_empty() {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+
                 Row::new(vec![
                     Cell::from(marker).style(marker_style),
-                    Cell::from(item.revision_name.clone()).style(rev_style),
+                    Cell::from(rev_display).style(rev_style),
                     Cell::from(pct_text).style(pct_style),
                     Cell::from(bar).style(Style::default().fg(bar_color)),
-                    Cell::from(item.tag.clone()).style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(tag_display).style(tag_style),
                 ])
             })
             .collect()
@@ -674,43 +956,105 @@ pub fn render_traffic_modal(f: &mut Frame, modal: &TrafficModalState, tick: usiz
 
     f.render_widget(rev_table, modal_chunks[1]);
 
-    // 3. Total / Sum validation line
-    let total = modal.total_percent();
-    let sum_line = match &modal.status {
-        TrafficModalStatus::Confirming => Line::from(vec![
-            Span::raw(" Total Split: "),
-            Span::styled("100% ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::styled("⚠ CONFIRMATION REQUIRED: Press [Enter] again to apply split", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        ]),
-        _ => {
-            if total == 100 {
+    // 3. Dynamic Visual Total Allocation Indicator & Validation
+    let bar_len = 20usize;
+    let filled_len = ((total.clamp(0, 100) as usize) * bar_len) / 100;
+    let empty_len = bar_len.saturating_sub(filled_len);
+
+    let progress_bar_str = if total > 100 {
+        format!("[{} +{}% OVER]", "█".repeat(bar_len), total - 100)
+    } else {
+        format!("[{}{}]", "█".repeat(filled_len), "░".repeat(empty_len))
+    };
+
+    let (bar_color, status_text, status_style) = if total == 100 {
+        (
+            Color::Green,
+            " ✓ Valid allocation (100/100%)".to_string(),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        )
+    } else if total < 100 {
+        (
+            Color::Red,
+            format!(" ✗ Incomplete: {}/100% (Need +{}%)", total, 100 - total),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            Color::Red,
+            format!(" ✗ Overallocated: {}/100% (Excess +{}%)", total, total - 100),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    };
+
+    let total_fraction_style = if total == 100 {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
+
+    let line1 = Line::from(vec![
+        Span::styled(" Total Allocation: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:>3}/100% ", total), total_fraction_style),
+        Span::styled(progress_bar_str, Style::default().fg(bar_color).add_modifier(Modifier::BOLD)),
+        Span::styled(status_text, status_style),
+    ]);
+
+    let line2 = match &modal.status {
+        TrafficModalStatus::Confirming => {
+            if modal.is_latest_zero_traffic() {
                 Line::from(vec![
-                    Span::raw(" Total Split: "),
-                    Span::styled("100% ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                    Span::styled("✓ Valid allocation (Press Enter to apply)", Style::default().fg(Color::Green)),
+                    Span::styled(
+                        format!(
+                            " ⚠ SAFETY WARNING: 0% traffic to latest revision ('{}')! Blackout risk. Press [Enter] to apply.",
+                            modal.latest_revision_name().unwrap_or("latest")
+                        ),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
                 ])
             } else {
-                let diff = 100 - total;
-                let diff_str = if diff > 0 {
-                    format!("(Remaining: {}%)", diff)
-                } else {
-                    format!("(Excess: {}%)", diff.abs())
-                };
                 Line::from(vec![
-                    Span::raw(" Total Split: "),
-                    Span::styled(format!("{}% ", total), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("✗ Must equal 100% {}", diff_str), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        " ⚠ CONFIRMATION REQUIRED: Press [Enter] again to apply traffic split immediately.",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            }
+        }
+        _ => {
+            if modal.is_latest_zero_traffic() && total == 100 {
+                Line::from(vec![
+                    Span::styled(
+                        format!(
+                            " ⚠ Notice: Latest revision ('{}') has 0% traffic. Safety blackout guardrail active.",
+                            modal.latest_revision_name().unwrap_or("latest")
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        " Use Left/Right arrows or digits to allocate exactly 100% across revisions.",
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ])
             }
         }
     };
-    let sum_widget = Paragraph::new(sum_line).block(Block::default().borders(Borders::BOTTOM));
+
+    let sum_border_color = if total == 100 { Color::Green } else { Color::Red };
+    let sum_widget = Paragraph::new(vec![line1, line2])
+        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(sum_border_color)));
     f.render_widget(sum_widget, modal_chunks[2]);
 
     // 4. Status / error message (wrapped to prevent clipping)
     let status_lines: Vec<Line> = match &modal.status {
         TrafficModalStatus::FetchingRevisions => vec![Line::from(vec![
-            Span::styled(format!(" {} Fetching revisions from Cloud Run...", spinner(tick)), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!(" {} Fetching revisions from Cloud Run API{} please wait", spinner(tick), dots),
+                Style::default().fg(Color::Yellow),
+            ),
         ])],
         TrafficModalStatus::Confirming => vec![Line::from(vec![
             Span::styled(
@@ -719,7 +1063,10 @@ pub fn render_traffic_modal(f: &mut Frame, modal: &TrafficModalState, tick: usiz
             ),
         ])],
         TrafficModalStatus::Submitting => vec![Line::from(vec![
-            Span::styled(format!(" {} Submitting traffic split to Google Cloud API...", spinner(tick)), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {} Submitting traffic split to Google Cloud API{} applying changes", spinner(tick), dots),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
         ])],
         TrafficModalStatus::Success(msg) => vec![Line::from(vec![
             Span::styled(format!(" ✓ {}", msg), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
@@ -735,9 +1082,19 @@ pub fn render_traffic_modal(f: &mut Frame, modal: &TrafficModalState, tick: usiz
                 ))
             })
             .collect(),
-        TrafficModalStatus::Idle => vec![
-            Line::from(Span::styled(" Tip: Type numbers (0-100), use Left/Right arrows to adjust, 'c' to clear, 'C' to clear all.", Style::default().fg(Color::DarkGray))),
-        ],
+        TrafficModalStatus::Idle => {
+            if modal.editing_tag {
+                vec![Line::from(Span::styled(
+                    format!(" Editing Tag for revision '{}'. Enter letters, numbers, or hyphens. Press [Enter] to save, [Esc] to cancel.", modal.revisions.get(modal.selected_index).map(|r| r.revision_name.as_str()).unwrap_or("")),
+                    Style::default().fg(Color::Yellow),
+                ))]
+            } else {
+                vec![Line::from(Span::styled(
+                    " Tip: Type numbers (0-100), Left/Right to adjust, 't' to edit tag, 'c' to clear, 'C' to clear all.",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            }
+        }
     };
     let status_paragraph = Paragraph::new(status_lines).wrap(Wrap { trim: true });
     f.render_widget(status_paragraph, modal_chunks[3]);
@@ -747,7 +1104,14 @@ pub fn render_traffic_modal(f: &mut Frame, modal: &TrafficModalState, tick: usiz
         TrafficModalStatus::Success(_) => " [Enter] or [Esc]: Return to main view ",
         TrafficModalStatus::Confirming => " [Enter]: Confirm deployment | [Esc] or navigation keys: Cancel confirmation ",
         TrafficModalStatus::Submitting => " Updating traffic split... please wait ",
-        _ => " [↑/↓]: Select | [0-9]: Enter % | [←/→] or [+/-]: ±5% | [c]: Clear | [C]: Clear all | [Enter]: Apply | [Esc]: Cancel ",
+        TrafficModalStatus::FetchingRevisions => " Loading revisions from GCP... please wait ",
+        _ => {
+            if modal.editing_tag {
+                " [Enter]: Save tag | [Esc]: Cancel tag edit | Type a-z, 0-9, hyphen "
+            } else {
+                " [↑/↓]: Select | [0-9]: Enter % | [←/→] or [+/-]: ±5% | [t]: Edit Tag | [c]: Clear | [C]: Clear all | [Enter]: Apply | [Esc]: Cancel "
+            }
+        }
     };
     let nav_widget = Paragraph::new(nav_text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(nav_widget, modal_chunks[4]);
@@ -837,7 +1201,7 @@ pub fn render_startup_error(f: &mut Frame, error_msg: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]
@@ -849,6 +1213,8 @@ mod tests {
         assert_eq!(modal.input_buffer, "");
         assert_eq!(modal.status, TrafficModalStatus::FetchingRevisions);
         assert_eq!(modal.total_percent(), 0);
+        assert!(!modal.editing_tag);
+        assert_eq!(modal.tag_input_buffer, "");
     }
 
     #[test]
@@ -856,16 +1222,8 @@ mod tests {
         let mut modal = TrafficModalState::new("web-service".to_string());
         assert_eq!(modal.total_percent(), 0);
 
-        modal.revisions.push(RevisionTrafficItem {
-            revision_name: "rev-1".to_string(),
-            percent: 70,
-            tag: "-".to_string(),
-        });
-        modal.revisions.push(RevisionTrafficItem {
-            revision_name: "rev-2".to_string(),
-            percent: 30,
-            tag: "-".to_string(),
-        });
+        modal.revisions.push(RevisionTrafficItem::new("rev-1", 70, "-"));
+        modal.revisions.push(RevisionTrafficItem::new("rev-2", 30, "-"));
         assert_eq!(modal.total_percent(), 100);
 
         modal.revisions[1].percent = 50;
@@ -910,21 +1268,9 @@ mod tests {
 
         // Add 3 revisions (indices 0, 1, 2)
         modal.revisions = vec![
-            RevisionTrafficItem {
-                revision_name: "rev-0".to_string(),
-                percent: 50,
-                tag: "-".to_string(),
-            },
-            RevisionTrafficItem {
-                revision_name: "rev-1".to_string(),
-                percent: 30,
-                tag: "-".to_string(),
-            },
-            RevisionTrafficItem {
-                revision_name: "rev-2".to_string(),
-                percent: 20,
-                tag: "-".to_string(),
-            },
+            RevisionTrafficItem::new("rev-0", 50, "-"),
+            RevisionTrafficItem::new("rev-1", 30, "-"),
+            RevisionTrafficItem::new("rev-2", 20, "-"),
         ];
 
         modal.input_buffer = "50".to_string();
@@ -961,11 +1307,7 @@ mod tests {
     fn test_percentage_clamping_and_digit_inputs() {
         let mut modal = TrafficModalState::new("svc".to_string());
         modal.status = TrafficModalStatus::Idle;
-        modal.revisions = vec![RevisionTrafficItem {
-            revision_name: "rev-0".to_string(),
-            percent: 0,
-            tag: "-".to_string(),
-        }];
+        modal.revisions = vec![RevisionTrafficItem::new("rev-0", 0, "-")];
 
         // Digit inputs
         modal.handle_key(KeyCode::Char('5'));
@@ -1033,11 +1375,7 @@ mod tests {
     fn test_input_buffer_backspacing_to_empty_resets_to_zero() {
         let mut modal = TrafficModalState::new("svc".to_string());
         modal.status = TrafficModalStatus::Idle;
-        modal.revisions = vec![RevisionTrafficItem {
-            revision_name: "rev-0".to_string(),
-            percent: 80,
-            tag: "-".to_string(),
-        }];
+        modal.revisions = vec![RevisionTrafficItem::new("rev-0", 80, "-")];
 
         // When input buffer is empty, hitting Backspace immediately resets percent to 0
         assert_eq!(modal.input_buffer, "");
@@ -1065,16 +1403,8 @@ mod tests {
         let mut modal = TrafficModalState::new("svc".to_string());
         modal.status = TrafficModalStatus::Idle;
         modal.revisions = vec![
-            RevisionTrafficItem {
-                revision_name: "rev-0".to_string(),
-                percent: 50,
-                tag: "-".to_string(),
-            },
-            RevisionTrafficItem {
-                revision_name: "rev-1".to_string(),
-                percent: 30,
-                tag: "-".to_string(),
-            },
+            RevisionTrafficItem::new("rev-0", 50, "-"),
+            RevisionTrafficItem::new("rev-1", 30, "-"),
         ];
 
         // Total is 80% (under 100%)
@@ -1105,16 +1435,8 @@ mod tests {
         let mut modal = TrafficModalState::new("svc".to_string());
         modal.status = TrafficModalStatus::Idle;
         modal.revisions = vec![
-            RevisionTrafficItem {
-                revision_name: "rev-0".to_string(),
-                percent: 70,
-                tag: "-".to_string(),
-            },
-            RevisionTrafficItem {
-                revision_name: "rev-1".to_string(),
-                percent: 30,
-                tag: "-".to_string(),
-            },
+            RevisionTrafficItem::new("rev-0", 70, "-"),
+            RevisionTrafficItem::new("rev-1", 30, "-"),
         ];
 
         // 1st Enter: total is 100% -> transitions to Confirming step
@@ -1127,8 +1449,8 @@ mod tests {
         assert_eq!(
             action,
             TrafficModalAction::Submit(vec![
-                ("rev-0".to_string(), 70),
-                ("rev-1".to_string(), 30),
+                TrafficSplitTarget::new("rev-0", 70, None),
+                TrafficSplitTarget::new("rev-1", 30, None),
             ])
         );
         assert_eq!(modal.status, TrafficModalStatus::Submitting);
@@ -1138,11 +1460,7 @@ mod tests {
     fn test_confirmation_canceled_by_esc_or_edit() {
         let mut modal = TrafficModalState::new("svc".to_string());
         modal.status = TrafficModalStatus::Idle;
-        modal.revisions = vec![RevisionTrafficItem {
-            revision_name: "rev-0".to_string(),
-            percent: 100,
-            tag: "-".to_string(),
-        }];
+        modal.revisions = vec![RevisionTrafficItem::new("rev-0", 100, "-")];
 
         // Enter -> Confirming
         modal.handle_key(KeyCode::Enter);
@@ -1172,16 +1490,8 @@ mod tests {
         let mut modal = TrafficModalState::new("svc".to_string());
         modal.status = TrafficModalStatus::Idle;
         modal.revisions = vec![
-            RevisionTrafficItem {
-                revision_name: "rev-0".to_string(),
-                percent: 60,
-                tag: "-".to_string(),
-            },
-            RevisionTrafficItem {
-                revision_name: "rev-1".to_string(),
-                percent: 40,
-                tag: "-".to_string(),
-            },
+            RevisionTrafficItem::new("rev-0", 60, "-"),
+            RevisionTrafficItem::new("rev-1", 40, "-"),
         ];
 
         // 'c' clears selected revision
@@ -1205,11 +1515,7 @@ mod tests {
     fn test_submitting_and_fetching_lockout_keys() {
         let mut modal = TrafficModalState::new("svc".to_string());
         modal.status = TrafficModalStatus::Submitting;
-        modal.revisions = vec![RevisionTrafficItem {
-            revision_name: "rev-0".to_string(),
-            percent: 100,
-            tag: "-".to_string(),
-        }];
+        modal.revisions = vec![RevisionTrafficItem::new("rev-0", 100, "-")];
 
         // Editing and Enter ignored while submitting
         assert_eq!(modal.handle_key(KeyCode::Enter), TrafficModalAction::None);
@@ -1228,5 +1534,181 @@ mod tests {
 
         assert_eq!(modal.handle_key(KeyCode::Enter), TrafficModalAction::Close);
         assert_eq!(modal.handle_key(KeyCode::Esc), TrafficModalAction::Close);
+    }
+
+    #[test]
+    fn test_tag_editing_flow() {
+        let mut modal = TrafficModalState::new("svc".to_string());
+        modal.status = TrafficModalStatus::Idle;
+        modal.revisions = vec![
+            RevisionTrafficItem::new("rev-0", 100, "-"),
+            RevisionTrafficItem::new("rev-1", 0, "existing-tag"),
+        ];
+
+        // Press 't' on rev-0: starts editing with empty buffer
+        modal.selected_index = 0;
+        modal.handle_key(KeyCode::Char('t'));
+        assert!(modal.editing_tag);
+        assert_eq!(modal.tag_input_buffer, "");
+
+        // Type 'canary'
+        for c in "canary".chars() {
+            modal.handle_key(KeyCode::Char(c));
+        }
+        assert_eq!(modal.tag_input_buffer, "canary");
+
+        // Backspace pops last char
+        modal.handle_key(KeyCode::Backspace);
+        assert_eq!(modal.tag_input_buffer, "canar");
+
+        // Type 'y' back
+        modal.handle_key(KeyCode::Char('y'));
+        assert_eq!(modal.tag_input_buffer, "canary");
+
+        // Enter saves tag
+        modal.handle_key(KeyCode::Enter);
+        assert!(!modal.editing_tag);
+        assert_eq!(modal.revisions[0].tag, "canary");
+
+        // Edit rev-1: pressing 't' loads existing tag
+        modal.selected_index = 1;
+        modal.handle_key(KeyCode::Char('t'));
+        assert!(modal.editing_tag);
+        assert_eq!(modal.tag_input_buffer, "existing-tag");
+
+        // Esc cancels without changing
+        modal.handle_key(KeyCode::Char('-'));
+        modal.handle_key(KeyCode::Char('2'));
+        assert_eq!(modal.tag_input_buffer, "existing-tag-2");
+        modal.handle_key(KeyCode::Esc);
+        assert!(!modal.editing_tag);
+        assert_eq!(modal.revisions[1].tag, "existing-tag");
+    }
+
+    #[test]
+    fn test_safety_guardrail_latest_zero_traffic() {
+        let mut modal = TrafficModalState::new("svc".to_string());
+        modal.status = TrafficModalStatus::Idle;
+        modal.revisions = vec![
+            RevisionTrafficItem::new("rev-latest", 0, "-").with_latest(true),
+            RevisionTrafficItem::new("rev-previous", 100, "-"),
+        ];
+
+        assert!(modal.is_latest_zero_traffic());
+        assert_eq!(modal.latest_revision_name(), Some("rev-latest"));
+
+        // Enter transitions to Confirming with guardrail
+        let action = modal.handle_key(KeyCode::Enter);
+        assert_eq!(action, TrafficModalAction::None);
+        assert_eq!(modal.status, TrafficModalStatus::Confirming);
+        assert!(modal.is_latest_zero_traffic());
+
+        // Esc cancels confirmation
+        let action = modal.handle_key(KeyCode::Esc);
+        assert_eq!(action, TrafficModalAction::None);
+        assert_eq!(modal.status, TrafficModalStatus::Idle);
+
+        // Adjust latest to 50, previous to 50
+        modal.revisions[0].percent = 50;
+        modal.revisions[1].percent = 50;
+        assert!(!modal.is_latest_zero_traffic());
+    }
+
+    #[test]
+    fn test_visual_allocation_computation() {
+        let mut modal = TrafficModalState::new("svc".to_string());
+        modal.revisions = vec![
+            RevisionTrafficItem::new("rev-1", 40, "-"),
+            RevisionTrafficItem::new("rev-2", 40, "-"),
+        ];
+        assert_eq!(modal.total_percent(), 80);
+
+        modal.revisions[1].percent = 60;
+        assert_eq!(modal.total_percent(), 100);
+
+        modal.revisions[1].percent = 80;
+        assert_eq!(modal.total_percent(), 120);
+    }
+
+    #[test]
+    fn test_toast_lifecycle_and_expiration() {
+        let toast = Toast::new("Sample info", ToastKind::Info);
+        assert_eq!(toast.message, "Sample info");
+        assert_eq!(toast.kind, ToastKind::Info);
+        assert!(!toast.is_expired());
+    }
+
+    #[test]
+    fn test_render_traffic_modal_render_all_states() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(100, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut modal = TrafficModalState::new("web-svc".to_string());
+        modal.status = TrafficModalStatus::Idle;
+        modal.revisions = vec![
+            RevisionTrafficItem::new("rev-1", 70, "candidate").with_latest(true),
+            RevisionTrafficItem::new("rev-2", 30, "-"),
+        ];
+
+        terminal.draw(|f| {
+            render_traffic_modal(f, &modal, 0);
+        }).unwrap();
+
+        // Also test with editing_tag
+        modal.editing_tag = true;
+        modal.tag_input_buffer = "my-tag".to_string();
+        terminal.draw(|f| {
+            render_traffic_modal(f, &modal, 1);
+        }).unwrap();
+
+        // Test with Confirming & zero latest traffic
+        modal.editing_tag = false;
+        modal.revisions[0].percent = 0;
+        modal.revisions[1].percent = 100;
+        modal.status = TrafficModalStatus::Confirming;
+        terminal.draw(|f| {
+            render_traffic_modal(f, &modal, 2);
+        }).unwrap();
+
+        // Test with Submitting
+        modal.status = TrafficModalStatus::Submitting;
+        terminal.draw(|f| {
+            render_traffic_modal(f, &modal, 3);
+        }).unwrap();
+
+        // Test with Error
+        modal.status = TrafficModalStatus::Error("Permission Denied (HTTP 403)".to_string());
+        terminal.draw(|f| {
+            render_traffic_modal(f, &modal, 4);
+        }).unwrap();
+
+        // Test with Success
+        modal.status = TrafficModalStatus::Success("All done".to_string());
+        terminal.draw(|f| {
+            render_traffic_modal(f, &modal, 5);
+        }).unwrap();
+    }
+
+    #[test]
+    fn test_render_toasts() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let toasts = vec![
+            Toast::new("Error occurred", ToastKind::Error),
+            Toast::new("Warning message", ToastKind::Warning),
+            Toast::new("Success notice", ToastKind::Success),
+            Toast::new("Info message", ToastKind::Info),
+        ];
+
+        terminal.draw(|f| {
+            render_toasts(f, &toasts);
+        }).unwrap();
     }
 }

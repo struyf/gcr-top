@@ -14,8 +14,8 @@ use ratatui::{backend::CrosstermBackend, widgets::TableState, Terminal};
 use std::{collections::HashMap, io, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use ui::{
-    BannerType, RevisionTrafficItem, TrafficModalAction, TrafficModalState, TrafficModalStatus,
-    UiState,
+    BannerType, RevisionTrafficItem, Toast, ToastKind, TrafficModalAction, TrafficModalState,
+    TrafficModalStatus, TrafficSplitTarget, UiState,
 };
 
 #[derive(Parser, Debug)]
@@ -68,6 +68,7 @@ pub struct AppState {
     pub is_fetching_logs: bool,
     pub traffic_modal: Option<TrafficModalState>,
     pub banner_message: Option<(String, BannerType, std::time::Instant)>,
+    pub toasts: Vec<Toast>,
     pub table_state: TableState,
     pub spinner_tick: usize,
 }
@@ -94,8 +95,29 @@ impl AppState {
             is_fetching_logs: false,
             traffic_modal: None,
             banner_message: None,
+            toasts: Vec::new(),
             table_state,
             spinner_tick: 0,
+        }
+    }
+
+    pub fn add_toast(&mut self, message: impl Into<String>, kind: ToastKind) {
+        if self.toasts.len() >= 4 {
+            self.toasts.remove(0);
+        }
+        self.toasts.push(Toast::new(message, kind));
+    }
+
+    pub fn prune_toasts(&mut self) {
+        self.toasts.retain(|t| !t.is_expired());
+    }
+
+    pub fn dismiss_oldest_toast(&mut self) -> bool {
+        if !self.toasts.is_empty() {
+            self.toasts.remove(0);
+            true
+        } else {
+            false
         }
     }
 
@@ -119,11 +141,12 @@ impl AppState {
                     || err.contains("Unauthenticated");
 
                 if self.services.is_empty() {
-                    self.services_error = Some(err);
+                    self.services_error = Some(err.clone());
                     self.is_auth_error = is_auth;
                 } else {
                     self.banner_message =
-                        Some((err, BannerType::Error, std::time::Instant::now()));
+                        Some((err.clone(), BannerType::Error, std::time::Instant::now()));
+                    self.add_toast(err, ToastKind::Error);
                 }
                 AppAction::None
             }
@@ -143,8 +166,9 @@ impl AppState {
                 error,
             } => {
                 if service_name == self.selected_service_name {
-                    self.log_error_msg = Some(error);
+                    self.log_error_msg = Some(error.clone());
                     self.is_fetching_logs = false;
+                    self.add_toast(format!("Log error ({}): {}", service_name, error), ToastKind::Warning);
                 }
                 AppAction::None
             }
@@ -165,7 +189,7 @@ impl AppState {
                                     .collect();
 
                                 let mut items = Vec::new();
-                                for rev in fetched_revs {
+                                for (idx, rev) in fetched_revs.into_iter().enumerate() {
                                     let name = rev.short_name().to_string();
                                     let (pct, tag) = existing_map
                                         .get(&name)
@@ -175,6 +199,7 @@ impl AppState {
                                         revision_name: name,
                                         percent: pct,
                                         tag,
+                                        is_latest: idx == 0,
                                     });
                                 }
 
@@ -201,6 +226,10 @@ impl AppState {
                                     BannerType::Info,
                                     std::time::Instant::now(),
                                 ));
+                                self.add_toast(
+                                    format!("Could not fetch revisions: {}", err),
+                                    ToastKind::Warning,
+                                );
                             }
                         }
                     }
@@ -226,6 +255,10 @@ impl AppState {
                                 BannerType::Success,
                                 std::time::Instant::now(),
                             ));
+                            self.add_toast(
+                                format!("Traffic split updated for {}", service_name),
+                                ToastKind::Success,
+                            );
                             action = AppAction::FetchServices;
                         }
                         Err(err) => {
@@ -233,6 +266,10 @@ impl AppState {
                                 "Failed to update traffic split: {}",
                                 err
                             ));
+                            self.add_toast(
+                                format!("Failed to update traffic: {}", err),
+                                ToastKind::Error,
+                            );
                         }
                     }
                 }
@@ -321,11 +358,14 @@ fn spawn_set_traffic_split(
     client: Arc<client::GcpClient>,
     tx: mpsc::Sender<AppEvent>,
     service_name: String,
-    splits: Vec<(String, i32)>,
+    splits: Vec<TrafficSplitTarget>,
 ) {
     tokio::spawn(async move {
-        let splits_ref: Vec<(&str, i32)> = splits.iter().map(|(r, p)| (r.as_str(), *p)).collect();
-        match client.set_traffic_split(&service_name, splits_ref).await {
+        let splits_ref: Vec<(&str, i32, Option<&str>)> = splits
+            .iter()
+            .map(|s| (s.revision.as_str(), s.percent, s.tag.as_deref()))
+            .collect();
+        match client.set_traffic_split_with_tags(&service_name, splits_ref).await {
             Ok(()) => {
                 let _ = tx.send(AppEvent::TrafficSplitResult {
                     service_name,
@@ -354,11 +394,15 @@ fn open_traffic_modal(
 
     let mut modal = TrafficModalState::new(svc_name.clone());
 
-    for (rev, pct, tag) in svc.traffic_details() {
+    let primary = svc.primary_revision();
+    let details = svc.traffic_details();
+    for (i, (rev, pct, tag)) in details.into_iter().enumerate() {
+        let is_latest = (rev == primary) || (i == 0);
         modal.revisions.push(RevisionTrafficItem {
             revision_name: rev,
             percent: pct,
             tag,
+            is_latest,
         });
     }
 
@@ -392,6 +436,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
     loop {
         app_state.spinner_tick = app_state.spinner_tick.wrapping_add(1);
+        app_state.prune_toasts();
 
         // Auto-dismiss banner if timeout has expired
         if let Some((_, ref b_type, created_at)) = app_state.banner_message {
@@ -448,6 +493,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     log_error_msg: app_state.log_error_msg.as_deref(),
                     banner_message: banner_ref,
                     traffic_modal: app_state.traffic_modal.as_ref(),
+                    toasts: &app_state.toasts,
                     spinner_tick: app_state.spinner_tick,
                 },
             );
@@ -484,6 +530,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                 KeyCode::Esc => {
                     if app_state.banner_message.is_some() {
                         app_state.banner_message = None;
+                    } else if app_state.dismiss_oldest_toast() {
+                        // Dismissed oldest toast
                     } else if app_state.show_logs {
                         app_state.show_logs = false;
                         app_state.log_error_msg = None;
@@ -498,6 +546,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     ) {
                         app_state.traffic_modal = Some(modal);
                     } else {
+                        app_state.add_toast("No service selected", ToastKind::Info);
                         app_state.banner_message = Some((
                             "No service selected".to_string(),
                             BannerType::Info,
@@ -619,6 +668,7 @@ mod tests {
         assert!(!state.show_logs);
         assert!(state.traffic_modal.is_none());
         assert!(state.banner_message.is_none());
+        assert!(state.toasts.is_empty());
         assert_eq!(state.table_state.selected(), Some(0));
     }
 
@@ -651,7 +701,7 @@ mod tests {
         assert!(state.services_error.is_some());
         assert!(state.banner_message.is_none());
 
-        // When services already exist, error appears in banner instead
+        // When services already exist, error appears in banner and toast instead
         state.services.push(Service {
             name: "web".to_string(),
             uri: None,
@@ -664,6 +714,8 @@ mod tests {
         let (msg, b_type, _) = state.banner_message.unwrap();
         assert_eq!(msg, "Network failure");
         assert_eq!(b_type, BannerType::Error);
+        assert_eq!(state.toasts.len(), 1);
+        assert_eq!(state.toasts[0].kind, ToastKind::Error);
     }
 
     #[test]
@@ -697,7 +749,9 @@ mod tests {
         assert_eq!(modal.revisions.len(), 2);
         assert_eq!(modal.revisions[0].revision_name, "rev-001");
         assert_eq!(modal.revisions[0].percent, 100); // Default first revision gets 100%
+        assert!(modal.revisions[0].is_latest);
         assert_eq!(modal.revisions[1].percent, 0);
+        assert!(!modal.revisions[1].is_latest);
         assert_eq!(modal.selected_index, 0);
     }
 
@@ -731,6 +785,7 @@ mod tests {
             revision_name: "rev-current".to_string(),
             percent: 100,
             tag: "-".to_string(),
+            is_latest: true,
         });
         modal.status = TrafficModalStatus::FetchingRevisions;
         state.traffic_modal = Some(modal);
@@ -749,6 +804,8 @@ mod tests {
         let (msg, b_type, _) = state.banner_message.unwrap();
         assert!(msg.contains("Temporary network outage"));
         assert_eq!(b_type, BannerType::Info);
+        assert_eq!(state.toasts.len(), 1);
+        assert_eq!(state.toasts[0].kind, ToastKind::Warning);
     }
 
     #[test]
@@ -771,6 +828,7 @@ mod tests {
             other => panic!("Expected Success, got {:?}", other),
         }
         assert!(state.banner_message.is_some());
+        assert!(state.toasts.iter().any(|t| t.kind == ToastKind::Success));
 
         // Error transition
         let mut modal = TrafficModalState::new("api-svc".to_string());
@@ -788,5 +846,279 @@ mod tests {
             }
             other => panic!("Expected Error, got {:?}", other),
         }
+        assert!(state.toasts.iter().any(|t| t.kind == ToastKind::Error));
+    }
+
+    #[tokio::test]
+    async fn test_mock_integration_full_user_journey() {
+        let server = wiremock::MockServer::start().await;
+        let client = Arc::new(
+            client::GcpClient::with_base_urls(
+                "test-project".to_string(),
+                "us-central1".to_string(),
+                server.uri(),
+                server.uri(),
+            )
+            .unwrap()
+            .with_token("test-mock-token"),
+        );
+
+        // 1. Mock list_revisions
+        let revs_response = serde_json::json!({
+            "revisions": [
+                {
+                    "name": "projects/test-project/locations/us-central1/services/web/revisions/web-00002",
+                    "createTime": "2024-01-02T00:00:00Z"
+                },
+                {
+                    "name": "projects/test-project/locations/us-central1/services/web/revisions/web-00001",
+                    "createTime": "2024-01-01T00:00:00Z"
+                }
+            ]
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/projects/test-project/locations/us-central1/services/web/revisions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(revs_response))
+            .mount(&server)
+            .await;
+
+        // 2. Mock patch traffic split
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/v2/projects/test-project/locations/us-central1/services/web"))
+            .and(wiremock::matchers::query_param("updateMask", "traffic"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let mut app_state = AppState::new();
+        app_state.services = vec![Service {
+            name: "projects/test-project/locations/us-central1/services/web".to_string(),
+            uri: Some("https://web.run.app".to_string()),
+            latest_ready_revision: Some("web-00002".to_string()),
+            conditions: None,
+            traffic_statuses: None,
+        }];
+
+        // User opens modal ('s')
+        let (tx, mut rx) = mpsc::channel(16);
+        let modal = open_traffic_modal(&app_state.services, &app_state.table_state, &client, &tx).unwrap();
+        app_state.traffic_modal = Some(modal);
+        assert_eq!(app_state.traffic_modal.as_ref().unwrap().status, TrafficModalStatus::FetchingRevisions);
+
+        // Background task returns revisions
+        let event = rx.recv().await.expect("Expected RevisionsFetched event");
+        let action = app_state.handle_event(event);
+        assert_eq!(action, AppAction::None);
+
+        let modal = app_state.traffic_modal.as_mut().unwrap();
+        assert_eq!(modal.status, TrafficModalStatus::Idle);
+        assert_eq!(modal.revisions.len(), 2);
+        assert_eq!(modal.revisions[0].revision_name, "web-00002");
+        assert!(modal.revisions[0].is_latest);
+
+        // Adjust traffic splits via simulated key presses
+        // Rev 0: Clear with 'c' -> 0%
+        modal.handle_key(KeyCode::Char('c'));
+        assert_eq!(modal.revisions[0].percent, 0);
+
+        // Enter 80% on rev 0: type '8', '0'
+        modal.handle_key(KeyCode::Char('8'));
+        modal.handle_key(KeyCode::Char('0'));
+        assert_eq!(modal.revisions[0].percent, 80);
+
+        // Assign tag 'candidate' on rev 0: press 't', type 'c','a','n','d','i','d','a','t','e', Enter
+        modal.handle_key(KeyCode::Char('t'));
+        assert!(modal.editing_tag);
+        for ch in "candidate".chars() {
+            modal.handle_key(KeyCode::Char(ch));
+        }
+        modal.handle_key(KeyCode::Enter);
+        assert!(!modal.editing_tag);
+        assert_eq!(modal.revisions[0].tag, "candidate");
+
+        // Move to rev 1: 'j'
+        modal.handle_key(KeyCode::Char('j'));
+        assert_eq!(modal.selected_index, 1);
+
+        // Enter 20% on rev 1: type '2', '0'
+        modal.handle_key(KeyCode::Char('2'));
+        modal.handle_key(KeyCode::Char('0'));
+        assert_eq!(modal.revisions[1].percent, 20);
+
+        assert_eq!(modal.total_percent(), 100);
+
+        // Submitting modal
+        // 1st Enter -> Confirming
+        let action = modal.handle_key(KeyCode::Enter);
+        assert_eq!(action, TrafficModalAction::None);
+        assert_eq!(modal.status, TrafficModalStatus::Confirming);
+
+        // 2nd Enter -> Submit action
+        let action = modal.handle_key(KeyCode::Enter);
+        let splits = match action {
+            TrafficModalAction::Submit(s) => s,
+            other => panic!("Expected Submit, got {:?}", other),
+        };
+        assert_eq!(splits.len(), 2);
+        assert_eq!(splits[0].revision, "web-00002");
+        assert_eq!(splits[0].percent, 80);
+        assert_eq!(splits[0].tag, Some("candidate".to_string()));
+        assert_eq!(splits[1].revision, "web-00001");
+        assert_eq!(splits[1].percent, 20);
+        assert_eq!(splits[1].tag, None);
+
+        // Execute submission against mock client
+        spawn_set_traffic_split(Arc::clone(&client), tx.clone(), "web".to_string(), splits);
+
+        let result_event = rx.recv().await.expect("Expected TrafficSplitResult");
+        let app_action = app_state.handle_event(result_event);
+        assert_eq!(app_action, AppAction::FetchServices);
+
+        let modal = app_state.traffic_modal.as_ref().unwrap();
+        match &modal.status {
+            TrafficModalStatus::Success(msg) => {
+                assert!(msg.contains("Traffic split updated successfully"));
+            }
+            other => panic!("Expected Success status, got {:?}", other),
+        }
+        assert!(app_state.toasts.iter().any(|t| t.kind == ToastKind::Success));
+    }
+
+    #[tokio::test]
+    async fn test_mock_submission_failure_403_permission_denied() {
+        let server = wiremock::MockServer::start().await;
+        let client = Arc::new(
+            client::GcpClient::with_base_urls(
+                "test-project".to_string(),
+                "us-central1".to_string(),
+                server.uri(),
+                server.uri(),
+            )
+            .unwrap()
+            .with_token("test-mock-token"),
+        );
+
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/v2/projects/test-project/locations/us-central1/services/web"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 403,
+                    "message": "The caller does not have permission",
+                    "status": "PERMISSION_DENIED"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut app_state = AppState::new();
+        let mut modal = TrafficModalState::new("web".to_string());
+        modal.status = TrafficModalStatus::Submitting;
+        app_state.traffic_modal = Some(modal);
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let splits = vec![TrafficSplitTarget::new("web-001", 100, None)];
+        spawn_set_traffic_split(client, tx, "web".to_string(), splits);
+
+        let event = rx.recv().await.expect("Expected TrafficSplitResult");
+        let action = app_state.handle_event(event);
+        assert_eq!(action, AppAction::None);
+
+        let modal = app_state.traffic_modal.as_ref().unwrap();
+        match &modal.status {
+            TrafficModalStatus::Error(err) => {
+                assert!(err.contains("Permission Denied"));
+                assert!(err.contains("Cloud Run Developer"));
+            }
+            other => panic!("Expected Error status, got {:?}", other),
+        }
+        assert!(app_state.toasts.iter().any(|t| t.kind == ToastKind::Error));
+    }
+
+    #[tokio::test]
+    async fn test_mock_submission_failure_409_conflict() {
+        let server = wiremock::MockServer::start().await;
+        let client = Arc::new(
+            client::GcpClient::with_base_urls(
+                "test-project".to_string(),
+                "us-central1".to_string(),
+                server.uri(),
+                server.uri(),
+            )
+            .unwrap()
+            .with_token("test-mock-token"),
+        );
+
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/v2/projects/test-project/locations/us-central1/services/web"))
+            .respond_with(wiremock::ResponseTemplate::new(409).set_body_string("Resource version conflict"))
+            .mount(&server)
+            .await;
+
+        let mut app_state = AppState::new();
+        let mut modal = TrafficModalState::new("web".to_string());
+        modal.status = TrafficModalStatus::Submitting;
+        app_state.traffic_modal = Some(modal);
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let splits = vec![TrafficSplitTarget::new("web-001", 100, None)];
+        spawn_set_traffic_split(client, tx, "web".to_string(), splits);
+
+        let event = rx.recv().await.expect("Expected TrafficSplitResult");
+        let action = app_state.handle_event(event);
+        assert_eq!(action, AppAction::None);
+
+        let modal = app_state.traffic_modal.as_ref().unwrap();
+        match &modal.status {
+            TrafficModalStatus::Error(err) => {
+                assert!(err.contains("Conflict detected"));
+                assert!(err.contains("concurrently"));
+            }
+            other => panic!("Expected Error status, got {:?}", other),
+        }
+        assert!(app_state.toasts.iter().any(|t| t.kind == ToastKind::Error));
+    }
+
+    #[tokio::test]
+    async fn test_mock_submission_failure_429_rate_limited() {
+        let server = wiremock::MockServer::start().await;
+        let client = Arc::new(
+            client::GcpClient::with_base_urls(
+                "test-project".to_string(),
+                "us-central1".to_string(),
+                server.uri(),
+                server.uri(),
+            )
+            .unwrap()
+            .with_token("test-mock-token"),
+        );
+
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/v2/projects/test-project/locations/us-central1/services/web"))
+            .respond_with(wiremock::ResponseTemplate::new(429).set_body_string("Rate limit exceeded"))
+            .mount(&server)
+            .await;
+
+        let mut app_state = AppState::new();
+        let mut modal = TrafficModalState::new("web".to_string());
+        modal.status = TrafficModalStatus::Submitting;
+        app_state.traffic_modal = Some(modal);
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let splits = vec![TrafficSplitTarget::new("web-001", 100, None)];
+        spawn_set_traffic_split(client, tx, "web".to_string(), splits);
+
+        let event = rx.recv().await.expect("Expected TrafficSplitResult");
+        let action = app_state.handle_event(event);
+        assert_eq!(action, AppAction::None);
+
+        let modal = app_state.traffic_modal.as_ref().unwrap();
+        match &modal.status {
+            TrafficModalStatus::Error(err) => {
+                assert!(err.contains("rate limit exceeded"));
+            }
+            other => panic!("Expected Error status, got {:?}", other),
+        }
+        assert!(app_state.toasts.iter().any(|t| t.kind == ToastKind::Error));
     }
 }
