@@ -1,11 +1,11 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct ServiceListResponse {
     pub services: Option<Vec<Service>>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct Service {
     pub name: String,
     pub uri: Option<String>,
@@ -79,14 +79,14 @@ impl Service {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct Condition {
     #[serde(rename = "type")]
     pub type_field: String,
     pub state: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct TrafficStatus {
     pub revision: Option<String>,
     pub percent: Option<i32>,
@@ -95,12 +95,40 @@ pub struct TrafficStatus {
     pub traffic_type: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct RevisionListResponse {
+    pub revisions: Option<Vec<Revision>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct Revision {
+    pub name: String,
+    pub conditions: Option<Vec<Condition>>,
+    #[serde(rename = "createTime")]
+    pub create_time: Option<String>,
+}
+
+impl Revision {
+    pub fn short_name(&self) -> &str {
+        self.name.rsplit('/').next().unwrap_or(&self.name)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_ready(&self) -> bool {
+        if let Some(ref conditions) = self.conditions {
+            conditions.iter().any(|c| c.state.as_deref() == Some("CONDITION_SUCCEEDED"))
+        } else {
+            true
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct LogEntriesResponse {
     pub entries: Option<Vec<LogEntry>>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct HttpRequestLog {
     #[serde(rename = "requestMethod")]
     pub request_method: Option<String>,
@@ -110,7 +138,7 @@ pub struct HttpRequestLog {
     pub latency: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct LogEntry {
     #[serde(rename = "textPayload")]
     pub text_payload: Option<String>,
@@ -153,5 +181,261 @@ impl LogEntry {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_traffic_summary_single_or_empty() {
+        let mut svc = Service {
+            name: "projects/test/locations/us-central1/services/web".to_string(),
+            uri: None,
+            latest_ready_revision: Some("web-001".to_string()),
+            conditions: None,
+            traffic_statuses: None,
+        };
+
+        // None traffic_statuses defaults to 100%
+        assert_eq!(svc.traffic_summary(), "100%");
+
+        // Empty vec defaults to 100%
+        svc.traffic_statuses = Some(vec![]);
+        assert_eq!(svc.traffic_summary(), "100%");
+
+        // Single 100%
+        svc.traffic_statuses = Some(vec![TrafficStatus {
+            revision: Some("web-001".to_string()),
+            percent: Some(100),
+            tag: None,
+            traffic_type: None,
+        }]);
+        assert_eq!(svc.traffic_summary(), "100%");
+
+        // Single 80%
+        svc.traffic_statuses = Some(vec![TrafficStatus {
+            revision: Some("web-001".to_string()),
+            percent: Some(80),
+            tag: None,
+            traffic_type: None,
+        }]);
+        assert_eq!(svc.traffic_summary(), "80%");
+    }
+
+    #[test]
+    fn test_traffic_summary_split() {
+        let svc = Service {
+            name: "projects/test/locations/us-central1/services/web".to_string(),
+            uri: None,
+            latest_ready_revision: Some("web-002".to_string()),
+            conditions: None,
+            traffic_statuses: Some(vec![
+                TrafficStatus {
+                    revision: Some("web-001".to_string()),
+                    percent: Some(70),
+                    tag: None,
+                    traffic_type: None,
+                },
+                TrafficStatus {
+                    revision: Some("web-002".to_string()),
+                    percent: Some(30),
+                    tag: None,
+                    traffic_type: None,
+                },
+            ]),
+        };
+
+        assert_eq!(svc.traffic_summary(), "70%/30% (Split)");
+    }
+
+    #[test]
+    fn test_traffic_details_fallback_and_present() {
+        // Fallback when None
+        let svc_none = Service {
+            name: "projects/p/locations/l/services/s".to_string(),
+            uri: None,
+            latest_ready_revision: Some("projects/p/locations/l/services/s/revisions/rev-99".to_string()),
+            conditions: None,
+            traffic_statuses: None,
+        };
+        let details = svc_none.traffic_details();
+        assert_eq!(details, vec![("rev-99".to_string(), 100, "-".to_string())]);
+
+        // Present with multiple statuses
+        let svc_present = Service {
+            name: "projects/p/locations/l/services/s".to_string(),
+            uri: None,
+            latest_ready_revision: None,
+            conditions: None,
+            traffic_statuses: Some(vec![
+                TrafficStatus {
+                    revision: Some("projects/.../rev-1".to_string()),
+                    percent: Some(60),
+                    tag: Some("candidate".to_string()),
+                    traffic_type: None,
+                },
+                TrafficStatus {
+                    revision: None,
+                    percent: None,
+                    tag: None,
+                    traffic_type: None,
+                },
+            ]),
+        };
+        let details = svc_present.traffic_details();
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0], ("rev-1".to_string(), 60, "candidate".to_string()));
+        assert_eq!(details[1], ("latest".to_string(), 0, "-".to_string()));
+    }
+
+    #[test]
+    fn test_service_is_ready() {
+        // With CONDITION_SUCCEEDED
+        let svc_ready = Service {
+            name: "s".to_string(),
+            uri: None,
+            latest_ready_revision: None,
+            conditions: Some(vec![Condition {
+                type_field: "Ready".to_string(),
+                state: Some("CONDITION_SUCCEEDED".to_string()),
+            }]),
+            traffic_statuses: None,
+        };
+        assert!(svc_ready.is_ready());
+
+        // With CONDITION_FAILED
+        let svc_failed = Service {
+            name: "s".to_string(),
+            uri: None,
+            latest_ready_revision: None,
+            conditions: Some(vec![Condition {
+                type_field: "Ready".to_string(),
+                state: Some("CONDITION_FAILED".to_string()),
+            }]),
+            traffic_statuses: None,
+        };
+        assert!(!svc_failed.is_ready());
+
+        // Fallback to latest_ready_revision if conditions is None
+        let svc_fallback = Service {
+            name: "s".to_string(),
+            uri: None,
+            latest_ready_revision: Some("rev-1".to_string()),
+            conditions: None,
+            traffic_statuses: None,
+        };
+        assert!(svc_fallback.is_ready());
+
+        let svc_not_ready = Service {
+            name: "s".to_string(),
+            uri: None,
+            latest_ready_revision: None,
+            conditions: None,
+            traffic_statuses: None,
+        };
+        assert!(!svc_not_ready.is_ready());
+    }
+
+    #[test]
+    fn test_log_entry_message_variants() {
+        // HTTP Request variant
+        let http_entry = LogEntry {
+            text_payload: None,
+            json_payload: None,
+            http_request: Some(HttpRequestLog {
+                request_method: Some("POST".to_string()),
+                request_url: Some("https://example.com/api/v1/checkout".to_string()),
+                status: Some(201),
+                latency: Some("0.125s".to_string()),
+            }),
+            severity: Some("INFO".to_string()),
+            timestamp: None,
+        };
+        assert_eq!(
+            http_entry.message().unwrap(),
+            "POST 201 api/v1/checkout 125.0ms"
+        );
+
+        // HTTP Request with default fallbacks
+        let http_default = LogEntry {
+            text_payload: None,
+            json_payload: None,
+            http_request: Some(HttpRequestLog {
+                request_method: None,
+                request_url: None,
+                status: None,
+                latency: None,
+            }),
+            severity: None,
+            timestamp: None,
+        };
+        assert_eq!(http_default.message().unwrap(), "GET 200 / -");
+
+        // Text payload variant
+        let text_entry = LogEntry {
+            text_payload: Some("  Container started on port 8080 \n".to_string()),
+            json_payload: None,
+            http_request: None,
+            severity: Some("INFO".to_string()),
+            timestamp: None,
+        };
+        assert_eq!(text_entry.message().unwrap(), "Container started on port 8080");
+
+        // JSON payload with message property
+        let json_msg_entry = LogEntry {
+            text_payload: None,
+            json_payload: Some(json!({
+                "message": "User authenticated successfully",
+                "uid": 12345
+            })),
+            http_request: None,
+            severity: Some("INFO".to_string()),
+            timestamp: None,
+        };
+        assert_eq!(
+            json_msg_entry.message().unwrap(),
+            "User authenticated successfully"
+        );
+
+        // JSON payload without message property
+        let json_raw_entry = LogEntry {
+            text_payload: None,
+            json_payload: Some(json!({"event": "heartbeat", "healthy": true})),
+            http_request: None,
+            severity: Some("DEBUG".to_string()),
+            timestamp: None,
+        };
+        assert_eq!(
+            json_raw_entry.message().unwrap(),
+            "{\"event\":\"heartbeat\",\"healthy\":true}"
+        );
+
+        // Completely empty entry
+        let empty_entry = LogEntry {
+            text_payload: None,
+            json_payload: None,
+            http_request: None,
+            severity: None,
+            timestamp: None,
+        };
+        assert_eq!(empty_entry.message(), None);
+    }
+
+    #[test]
+    fn test_revision_model() {
+        let rev = Revision {
+            name: "projects/p/locations/l/services/s/revisions/s-00042-abc".to_string(),
+            conditions: Some(vec![Condition {
+                type_field: "Ready".to_string(),
+                state: Some("CONDITION_SUCCEEDED".to_string()),
+            }]),
+            create_time: Some("2024-01-01T00:00:00Z".to_string()),
+        };
+
+        assert_eq!(rev.short_name(), "s-00042-abc");
+        assert!(rev.is_ready());
     }
 }
