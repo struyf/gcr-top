@@ -376,6 +376,7 @@ fn spawn_set_traffic_split(
     client: Arc<client::GcpClient>,
     tx: mpsc::Sender<AppEvent>,
     service_name: String,
+    full_service_name: String,
     splits: Vec<TrafficSplitTarget>,
 ) {
     tokio::spawn(async move {
@@ -383,7 +384,7 @@ fn spawn_set_traffic_split(
             .iter()
             .map(|s| (s.revision.as_str(), s.percent, s.tag.as_deref()))
             .collect();
-        match client.set_traffic_split_with_tags(&service_name, splits_ref).await {
+        match client.set_traffic_split_with_tags(&full_service_name, splits_ref).await {
             Ok(()) => {
                 let _ = tx.send(AppEvent::TrafficSplitResult {
                     service_name,
@@ -410,7 +411,7 @@ fn open_traffic_modal(
     let svc = services.get(idx)?;
     let svc_name = svc.short_name().to_string();
 
-    let mut modal = TrafficModalState::new(svc_name.clone());
+    let mut modal = TrafficModalState::new(svc_name.clone(), svc.name.clone());
 
     let primary = svc.primary_revision();
     let details = svc.traffic_details();
@@ -549,6 +550,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             Arc::clone(&client),
                             tx.clone(),
                             modal.service_name.clone(),
+                            modal.full_service_name.clone(),
                             splits,
                         );
                     }
@@ -754,7 +756,7 @@ mod tests {
     #[test]
     fn test_app_event_revisions_fetched_success() {
         let mut state = AppState::new();
-        let mut modal = TrafficModalState::new("web-service".to_string());
+        let mut modal = TrafficModalState::new("web-service".to_string(), "projects/p/locations/l/services/web-service".to_string());
         modal.status = TrafficModalStatus::FetchingRevisions;
         state.traffic_modal = Some(modal);
 
@@ -791,7 +793,7 @@ mod tests {
     #[test]
     fn test_revisions_fetched_populates_zero_percent_traffic_revisions() {
         let mut state = AppState::new();
-        let mut modal = TrafficModalState::new("web-service".to_string());
+        let mut modal = TrafficModalState::new("web-service".to_string(), "projects/p/locations/l/services/web-service".to_string());
         modal.revisions.push(RevisionTrafficItem {
             revision_name: "rev-001".to_string(),
             percent: 100,
@@ -837,7 +839,7 @@ mod tests {
     #[test]
     fn test_app_event_revisions_fetched_error_with_no_prior_revisions() {
         let mut state = AppState::new();
-        let mut modal = TrafficModalState::new("web-service".to_string());
+        let mut modal = TrafficModalState::new("web-service".to_string(), "projects/p/locations/l/services/web-service".to_string());
         modal.status = TrafficModalStatus::FetchingRevisions;
         state.traffic_modal = Some(modal);
 
@@ -859,7 +861,7 @@ mod tests {
     #[test]
     fn test_app_event_revisions_fetched_error_with_existing_revisions_falls_back() {
         let mut state = AppState::new();
-        let mut modal = TrafficModalState::new("web-service".to_string());
+        let mut modal = TrafficModalState::new("web-service".to_string(), "projects/p/locations/l/services/web-service".to_string());
         modal.revisions.push(RevisionTrafficItem {
             revision_name: "rev-current".to_string(),
             percent: 100,
@@ -890,7 +892,7 @@ mod tests {
     #[test]
     fn test_app_event_traffic_split_result_success_and_error() {
         let mut state = AppState::new();
-        let mut modal = TrafficModalState::new("api-svc".to_string());
+        let mut modal = TrafficModalState::new("api-svc".to_string(), "projects/p/locations/l/services/api-svc".to_string());
         modal.status = TrafficModalStatus::Submitting;
         state.traffic_modal = Some(modal);
 
@@ -910,7 +912,7 @@ mod tests {
         assert!(state.toasts.iter().any(|t| t.kind == ToastKind::Success));
 
         // Error transition
-        let mut modal = TrafficModalState::new("api-svc".to_string());
+        let mut modal = TrafficModalState::new("api-svc".to_string(), "projects/p/locations/l/services/api-svc".to_string());
         modal.status = TrafficModalStatus::Submitting;
         state.traffic_modal = Some(modal);
 
@@ -1048,7 +1050,7 @@ mod tests {
         assert_eq!(splits[1].tag, None);
 
         // Execute submission against mock client
-        spawn_set_traffic_split(Arc::clone(&client), tx.clone(), "web".to_string(), splits);
+        spawn_set_traffic_split(Arc::clone(&client), tx.clone(), "web".to_string(), "projects/test-project/locations/us-central1/services/web".to_string(), splits);
 
         let result_event = rx.recv().await.expect("Expected TrafficSplitResult");
         let app_action = app_state.handle_event(result_event);
@@ -1191,13 +1193,13 @@ mod tests {
             .await;
 
         let mut app_state = AppState::new();
-        let mut modal = TrafficModalState::new("web".to_string());
+        let mut modal = TrafficModalState::new("web".to_string(), "projects/test-project/locations/us-central1/services/web".to_string());
         modal.status = TrafficModalStatus::Submitting;
         app_state.traffic_modal = Some(modal);
 
         let (tx, mut rx) = mpsc::channel(16);
         let splits = vec![TrafficSplitTarget::new("web-001", 100, None)];
-        spawn_set_traffic_split(client, tx, "web".to_string(), splits);
+        spawn_set_traffic_split(client, tx, "web".to_string(), "projects/test-project/locations/us-central1/services/web".to_string(), splits);
 
         let event = rx.recv().await.expect("Expected TrafficSplitResult");
         let action = app_state.handle_event(event);
@@ -1235,13 +1237,13 @@ mod tests {
             .await;
 
         let mut app_state = AppState::new();
-        let mut modal = TrafficModalState::new("web".to_string());
+        let mut modal = TrafficModalState::new("web".to_string(), "projects/test-project/locations/us-central1/services/web".to_string());
         modal.status = TrafficModalStatus::Submitting;
         app_state.traffic_modal = Some(modal);
 
         let (tx, mut rx) = mpsc::channel(16);
         let splits = vec![TrafficSplitTarget::new("web-001", 100, None)];
-        spawn_set_traffic_split(client, tx, "web".to_string(), splits);
+        spawn_set_traffic_split(client, tx, "web".to_string(), "projects/test-project/locations/us-central1/services/web".to_string(), splits);
 
         let event = rx.recv().await.expect("Expected TrafficSplitResult");
         let action = app_state.handle_event(event);
@@ -1279,13 +1281,13 @@ mod tests {
             .await;
 
         let mut app_state = AppState::new();
-        let mut modal = TrafficModalState::new("web".to_string());
+        let mut modal = TrafficModalState::new("web".to_string(), "projects/test-project/locations/us-central1/services/web".to_string());
         modal.status = TrafficModalStatus::Submitting;
         app_state.traffic_modal = Some(modal);
 
         let (tx, mut rx) = mpsc::channel(16);
         let splits = vec![TrafficSplitTarget::new("web-001", 100, None)];
-        spawn_set_traffic_split(client, tx, "web".to_string(), splits);
+        spawn_set_traffic_split(client, tx, "web".to_string(), "projects/test-project/locations/us-central1/services/web".to_string(), splits);
 
         let event = rx.recv().await.expect("Expected TrafficSplitResult");
         let action = app_state.handle_event(event);
@@ -1299,5 +1301,95 @@ mod tests {
             other => panic!("Expected Error status, got {:?}", other),
         }
         assert!(app_state.toasts.iter().any(|t| t.kind == ToastKind::Error));
+    }
+
+    #[tokio::test]
+    async fn test_mock_integration_aggregate_region_traffic_split_with_concrete_location() {
+        let server = wiremock::MockServer::start().await;
+        let client = Arc::new(
+            client::GcpClient::with_base_urls(
+                "test-project".to_string(),
+                "-".to_string(),
+                server.uri(),
+                server.uri(),
+            )
+            .unwrap()
+            .with_token("test-mock-token"),
+        );
+
+        // Mock list_revisions to the concrete location europe-west1
+        let revs_response = serde_json::json!({
+            "revisions": [
+                {
+                    "name": "projects/test-project/locations/europe-west1/services/api/revisions/api-00002",
+                    "createTime": "2024-01-02T00:00:00Z"
+                }
+            ]
+        });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/projects/test-project/locations/europe-west1/services/api/revisions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(revs_response))
+            .mount(&server)
+            .await;
+
+        // Mock PATCH to the concrete location europe-west1
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/v2/projects/test-project/locations/europe-west1/services/api"))
+            .and(wiremock::matchers::query_param("updateMask", "traffic"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "projects/test-project/locations/europe-west1/services/api"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut app_state = AppState::new();
+        app_state.services = vec![Service {
+            name: "projects/test-project/locations/europe-west1/services/api".to_string(),
+            uri: Some("https://api.run.app".to_string()),
+            latest_ready_revision: Some("api-00002".to_string()),
+            conditions: None,
+            traffic_statuses: None,
+        }];
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let modal = open_traffic_modal(&app_state.services, &app_state.table_state, &client, &tx).unwrap();
+        assert_eq!(modal.service_name, "api");
+        assert_eq!(modal.full_service_name, "projects/test-project/locations/europe-west1/services/api");
+
+        app_state.traffic_modal = Some(modal);
+
+        // Receive background fetch revisions event
+        let rev_event = rx.recv().await.expect("Expected RevisionsFetched event");
+        let rev_action = app_state.handle_event(rev_event);
+        assert_eq!(rev_action, AppAction::None);
+
+        let splits = vec![TrafficSplitTarget::new("api-00002", 100, None)];
+        let modal_ref = app_state.traffic_modal.as_ref().unwrap();
+        spawn_set_traffic_split(
+            Arc::clone(&client),
+            tx.clone(),
+            modal_ref.service_name.clone(),
+            modal_ref.full_service_name.clone(),
+            splits,
+        );
+
+        let event = rx.recv().await.expect("Expected TrafficSplitResult");
+        match &event {
+            AppEvent::TrafficSplitResult { service_name, result } => {
+                assert_eq!(service_name, "api");
+                assert!(result.is_ok());
+            }
+            other => panic!("Expected TrafficSplitResult, got {:?}", other),
+        }
+
+        let action = app_state.handle_event(event);
+        assert_eq!(action, AppAction::FetchServices);
+        let modal = app_state.traffic_modal.as_ref().unwrap();
+        match &modal.status {
+            TrafficModalStatus::Success(msg) => {
+                assert!(msg.contains("Traffic split updated successfully"));
+            }
+            other => panic!("Expected Success status, got {:?}", other),
+        }
     }
 }

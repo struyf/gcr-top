@@ -129,6 +129,7 @@ pub enum TrafficModalAction {
 #[derive(Debug, Clone)]
 pub struct TrafficModalState {
     pub service_name: String,
+    pub full_service_name: String,
     pub revisions: Vec<RevisionTrafficItem>,
     pub selected_index: usize,
     pub input_buffer: String,
@@ -138,9 +139,10 @@ pub struct TrafficModalState {
 }
 
 impl TrafficModalState {
-    pub fn new(service_name: String) -> Self {
+    pub fn new(service_name: String, full_service_name: String) -> Self {
         Self {
             service_name,
+            full_service_name,
             revisions: Vec::new(),
             selected_index: 0,
             input_buffer: String::new(),
@@ -1206,8 +1208,12 @@ pub mod tests {
 
     #[test]
     fn test_traffic_modal_state_new() {
-        let modal = TrafficModalState::new("web-service".to_string());
+        let modal = TrafficModalState::new(
+            "web-service".to_string(),
+            "projects/p/locations/l/services/web-service".to_string(),
+        );
         assert_eq!(modal.service_name, "web-service");
+        assert_eq!(modal.full_service_name, "projects/p/locations/l/services/web-service");
         assert!(modal.revisions.is_empty());
         assert_eq!(modal.selected_index, 0);
         assert_eq!(modal.input_buffer, "");
@@ -1219,7 +1225,7 @@ pub mod tests {
 
     #[test]
     fn test_traffic_modal_state_total_percent() {
-        let mut modal = TrafficModalState::new("web-service".to_string());
+        let mut modal = TrafficModalState::new("web-service".to_string(), "projects/p/locations/l/services/web-service".to_string());
         assert_eq!(modal.total_percent(), 0);
 
         modal.revisions.push(RevisionTrafficItem::new("rev-1", 70, "-"));
@@ -1257,7 +1263,7 @@ pub mod tests {
 
     #[test]
     fn test_navigation_bounds() {
-        let mut modal = TrafficModalState::new("svc".to_string());
+        let mut modal = TrafficModalState::new("svc".to_string(), "projects/p/locations/l/services/svc".to_string());
         modal.status = TrafficModalStatus::Idle;
 
         // Empty revisions list navigation does not crash
@@ -1305,7 +1311,7 @@ pub mod tests {
 
     #[test]
     fn test_percentage_clamping_and_digit_inputs() {
-        let mut modal = TrafficModalState::new("svc".to_string());
+        let mut modal = TrafficModalState::new("svc".to_string(), "projects/p/locations/l/services/svc".to_string());
         modal.status = TrafficModalStatus::Idle;
         modal.revisions = vec![RevisionTrafficItem::new("rev-0", 0, "-")];
 
@@ -1373,7 +1379,7 @@ pub mod tests {
 
     #[test]
     fn test_input_buffer_backspacing_to_empty_resets_to_zero() {
-        let mut modal = TrafficModalState::new("svc".to_string());
+        let mut modal = TrafficModalState::new("svc".to_string(), "projects/p/locations/l/services/svc".to_string());
         modal.status = TrafficModalStatus::Idle;
         modal.revisions = vec![RevisionTrafficItem::new("rev-0", 80, "-")];
 
@@ -1400,7 +1406,7 @@ pub mod tests {
 
     #[test]
     fn test_enter_rejected_when_total_not_100() {
-        let mut modal = TrafficModalState::new("svc".to_string());
+        let mut modal = TrafficModalState::new("svc".to_string(), "projects/p/locations/l/services/svc".to_string());
         modal.status = TrafficModalStatus::Idle;
         modal.revisions = vec![
             RevisionTrafficItem::new("rev-0", 50, "-"),
@@ -1432,7 +1438,7 @@ pub mod tests {
 
     #[test]
     fn test_confirmation_step_flow() {
-        let mut modal = TrafficModalState::new("svc".to_string());
+        let mut modal = TrafficModalState::new("svc".to_string(), "projects/p/locations/l/services/svc".to_string());
         modal.status = TrafficModalStatus::Idle;
         modal.revisions = vec![
             RevisionTrafficItem::new("rev-0", 70, "-"),
@@ -1458,7 +1464,7 @@ pub mod tests {
 
     #[test]
     fn test_confirmation_canceled_by_esc_or_edit() {
-        let mut modal = TrafficModalState::new("svc".to_string());
+        let mut modal = TrafficModalState::new("svc".to_string(), "projects/p/locations/l/services/svc".to_string());
         modal.status = TrafficModalStatus::Idle;
         modal.revisions = vec![RevisionTrafficItem::new("rev-0", 100, "-")];
 
@@ -1487,7 +1493,7 @@ pub mod tests {
 
     #[test]
     fn test_bulk_actions_c_and_uppercase_c() {
-        let mut modal = TrafficModalState::new("svc".to_string());
+        let mut modal = TrafficModalState::new("svc".to_string(), "projects/p/locations/l/services/svc".to_string());
         modal.status = TrafficModalStatus::Idle;
         modal.revisions = vec![
             RevisionTrafficItem::new("rev-0", 60, "-"),
@@ -1513,7 +1519,7 @@ pub mod tests {
 
     #[test]
     fn test_submitting_and_fetching_lockout_keys() {
-        let mut modal = TrafficModalState::new("svc".to_string());
+        let mut modal = TrafficModalState::new("svc".to_string(), "projects/p/locations/l/services/svc".to_string());
         modal.status = TrafficModalStatus::Submitting;
         modal.revisions = vec![RevisionTrafficItem::new("rev-0", 100, "-")];
 
@@ -1529,7 +1535,7 @@ pub mod tests {
 
     #[test]
     fn test_success_status_close_on_enter_or_esc() {
-        let mut modal = TrafficModalState::new("svc".to_string());
+        let mut modal = TrafficModalState::new("svc".to_string(), "projects/p/locations/l/services/svc".to_string());
         modal.status = TrafficModalStatus::Success("Done".to_string());
 
         assert_eq!(modal.handle_key(KeyCode::Enter), TrafficModalAction::Close);
@@ -1538,7 +1544,7 @@ pub mod tests {
 
     #[test]
     fn test_tag_editing_flow() {
-        let mut modal = TrafficModalState::new("svc".to_string());
+        let mut modal = TrafficModalState::new("svc".to_string(), "projects/p/locations/l/services/svc".to_string());
         modal.status = TrafficModalStatus::Idle;
         modal.revisions = vec![
             RevisionTrafficItem::new("rev-0", 100, "-"),
@@ -1587,7 +1593,7 @@ pub mod tests {
 
     #[test]
     fn test_safety_guardrail_latest_zero_traffic() {
-        let mut modal = TrafficModalState::new("svc".to_string());
+        let mut modal = TrafficModalState::new("svc".to_string(), "projects/p/locations/l/services/svc".to_string());
         modal.status = TrafficModalStatus::Idle;
         modal.revisions = vec![
             RevisionTrafficItem::new("rev-latest", 0, "-").with_latest(true),
@@ -1616,7 +1622,7 @@ pub mod tests {
 
     #[test]
     fn test_visual_allocation_computation() {
-        let mut modal = TrafficModalState::new("svc".to_string());
+        let mut modal = TrafficModalState::new("svc".to_string(), "projects/p/locations/l/services/svc".to_string());
         modal.revisions = vec![
             RevisionTrafficItem::new("rev-1", 40, "-"),
             RevisionTrafficItem::new("rev-2", 40, "-"),
@@ -1646,7 +1652,7 @@ pub mod tests {
         let backend = TestBackend::new(100, 35);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let mut modal = TrafficModalState::new("web-svc".to_string());
+        let mut modal = TrafficModalState::new("web-svc".to_string(), "projects/p/locations/l/services/web-svc".to_string());
         modal.status = TrafficModalStatus::Idle;
         modal.revisions = vec![
             RevisionTrafficItem::new("rev-1", 70, "candidate").with_latest(true),
