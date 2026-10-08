@@ -588,7 +588,7 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
             .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
     )
     .block(Block::default().borders(Borders::ALL).title(table_title))
-    .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     f.render_stateful_widget(table, table_chunk, state.table_state);
 

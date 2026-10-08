@@ -590,7 +590,7 @@ async fn run_app<B: ratatui::backend::Backend>(
     client: Arc<client::GcpClient>,
     project: &str,
     region: &str,
-) -> Result<()> {
+) -> Result<()> where <B as ratatui::backend::Backend>::Error: std::error::Error + Send + Sync + 'static {
     let (tx, mut rx) = mpsc::channel::<AppEvent>(64);
     let mut app_state = AppState::new();
 
