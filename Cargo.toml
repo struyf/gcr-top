@@ -4,9 +4,10 @@ version = "1.0.0"
 edition = "2024"
 authors = ["Matthias Struyf <matthias@rfc4301.dev>"]
 description = "A blazingly fast htop-like TUI monitor for Google Cloud Run services"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/struyf/gcr-top"
-keywords = ["gcp", "cloud-run", "tui", "cli", "monitoring"]
+readme = "README.md"
+keywords = ["google-cloud", "cloud-run", "tui", "ratatui", "monitoring"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
