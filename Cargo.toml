@@ -1,6 +1,6 @@
 [package]
 name = "gcr-top"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 authors = ["Matthias Struyf <matthias@rfc4301.dev>"]
 description = "A blazingly fast htop-like TUI monitor for Google Cloud Run services"
