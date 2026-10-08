@@ -412,7 +412,7 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 pub struct UiState<'a> {
     pub project: &'a str,
     pub region: &'a str,
-    pub services: &'a [Service],
+    pub services: &'a [&'a Service],
     pub table_state: &'a mut TableState,
     pub is_fetching_services: bool,
     pub services_error: Option<&'a str>,
@@ -426,6 +426,8 @@ pub struct UiState<'a> {
     pub traffic_modal: Option<&'a TrafficModalState>,
     pub toasts: &'a [Toast],
     pub spinner_tick: usize,
+    pub search_query: &'a str,
+    pub is_searching: bool,
 }
 
 pub fn render_ui(f: &mut Frame, state: UiState) {
@@ -433,6 +435,7 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
 
     // If services are empty and there is an error, show the startup error screen
     if state.services.is_empty()
+        && state.search_query.is_empty()
         && let Some(err) = state.services_error {
             if state.is_auth_error {
                 render_auth_error(f, err);
@@ -446,7 +449,7 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
     let banner_active = state.banner_message.is_some();
 
     // Compute main vertical layout
-    let constraints = if banner_active {
+    let mut constraints = if banner_active {
         if state.show_logs {
             vec![
                 Constraint::Length(3), // Header
@@ -479,6 +482,10 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
             Constraint::Length(3), // Footer
         ]
     };
+
+    if state.is_searching {
+        constraints.push(Constraint::Length(3));
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -554,10 +561,16 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
         })
         .collect();
 
-    let table_title = if state.is_fetching_services {
-        format!(" Services [ {} Fetching{} ] ", spinner(state.spinner_tick), dots)
+    let filter_indicator = if !state.search_query.is_empty() {
+        format!(" [Filter: \"{}\"]", state.search_query)
     } else {
-        format!(" Services ({}) ", state.services.len())
+        String::new()
+    };
+
+    let table_title = if state.is_fetching_services {
+        format!(" Services [ {} Fetching{} ]{} ", spinner(state.spinner_tick), dots, filter_indicator)
+    } else {
+        format!(" Services ({}){} ", state.services.len(), filter_indicator)
     };
 
     let table = Table::new(
@@ -655,7 +668,7 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
         f.render_widget(log_widget, middle_chunk);
     } else {
         // Traffic Allocations Inspector
-        let selected_svc = state.table_state.selected().and_then(|idx| state.services.get(idx));
+        let selected_svc = state.table_state.selected().and_then(|idx| state.services.get(idx)).copied();
         let traffic_lines = match selected_svc {
             Some(svc) => {
                 let details = svc.traffic_details();
@@ -685,6 +698,8 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
 
     // 4. Footer
     let footer_chunk = chunks[chunk_idx];
+    chunk_idx += 1;
+
     let footer_text = if let Some(modal) = state.traffic_modal {
         if modal.editing_tag {
             " [Enter]: Save tag | [Esc]: Cancel tag edit | Type a-z, 0-9, hyphen "
@@ -693,10 +708,12 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
         } else {
             " [↑/↓]: Select Revision | [0-9]: Enter % | [←/→] or [+/-]: Adjust | [t]: Edit Tag | [c]: Clear | [C]: Clear all | [Enter]: Confirm | [Esc]: Cancel "
         }
+    } else if state.is_searching {
+        " [Enter]: Keep filter | [Esc]: Cancel search | [Backspace]: Delete "
     } else if state.show_logs {
-        " [Esc]: Close Logs | [j/k]: Select Service | [s]: Traffic Split | [o]: Open URL | [q]: Quit "
+        " [Esc]: Close Logs | [/]: Filter | [j/k]: Select Service | [s]: Traffic Split | [o]: Open URL | [q]: Quit "
     } else {
-        " [s]: Traffic Split | [l]: View Logs | [j/k]: Select Service | [o]: Open URL | [r]: Refresh | [q]: Quit "
+        " [s]: Traffic Split | [l]: View Logs | [/]: Filter | [j/k]: Select Service | [o]: Open URL | [r]: Refresh | [q]: Quit "
     };
 
     let footer = Paragraph::new(footer_text)
@@ -704,12 +721,26 @@ pub fn render_ui(f: &mut Frame, state: UiState) {
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, footer_chunk);
 
-    // 5. Traffic Split Modal (renders on top using Clear widget)
+    // 5. Search Bar (conditionally rendered when is_searching is true)
+    if state.is_searching {
+        let search_chunk = chunks[chunk_idx];
+        let search_bar = Paragraph::new(format!("/{}", state.search_query))
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Search ")
+                    .border_style(Style::default().fg(Color::Yellow)),
+            );
+        f.render_widget(search_bar, search_chunk);
+    }
+
+    // 6. Traffic Split Modal (renders on top using Clear widget)
     if let Some(modal) = state.traffic_modal {
         render_traffic_modal(f, modal, state.spinner_tick);
     }
 
-    // 6. Global Floating Toast Notifications
+    // 7. Global Floating Toast Notifications
     render_toasts(f, state.toasts);
 }
 
@@ -1716,5 +1747,93 @@ pub mod tests {
         terminal.draw(|f| {
             render_toasts(f, &toasts);
         }).unwrap();
+    }
+    #[test]
+    fn test_render_ui_with_filter_and_searching() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(120, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let services = vec![Service {
+            name: "projects/p/locations/us-central1/services/web-frontend".to_string(),
+            uri: Some("https://web.run.app".to_string()),
+            latest_ready_revision: Some("rev-1".to_string()),
+            conditions: None,
+            traffic_statuses: None,
+        }];
+        let svc_refs: Vec<&Service> = services.iter().collect();
+        let mut table_state = TableState::default();
+        table_state.select(Some(0));
+
+        // 1. Render when searching is true
+        terminal
+            .draw(|f| {
+                render_ui(
+                    f,
+                    UiState {
+                        project: "test-proj",
+                        region: "us-central1",
+                        services: &svc_refs,
+                        table_state: &mut table_state,
+                        is_fetching_services: false,
+                        services_error: None,
+                        is_auth_error: false,
+                        show_logs: false,
+                        logs: &[],
+                        selected_service_name: "web-frontend",
+                        is_fetching_logs: false,
+                        log_error_msg: None,
+                        banner_message: None,
+                        traffic_modal: None,
+                        toasts: &[],
+                        spinner_tick: 0,
+                        search_query: "frontend",
+                        is_searching: true,
+                    },
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let buffer_str: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(buffer_str.contains("[Filter: \"frontend\"]"));
+        assert!(buffer_str.contains("/frontend"));
+        assert!(buffer_str.contains("web-frontend"));
+
+        // 2. Render when filter is active but searching is false
+        terminal
+            .draw(|f| {
+                render_ui(
+                    f,
+                    UiState {
+                        project: "test-proj",
+                        region: "us-central1",
+                        services: &svc_refs,
+                        table_state: &mut table_state,
+                        is_fetching_services: false,
+                        services_error: None,
+                        is_auth_error: false,
+                        show_logs: false,
+                        logs: &[],
+                        selected_service_name: "web-frontend",
+                        is_fetching_logs: false,
+                        log_error_msg: None,
+                        banner_message: None,
+                        traffic_modal: None,
+                        toasts: &[],
+                        spinner_tick: 0,
+                        search_query: "frontend",
+                        is_searching: false,
+                    },
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let buffer_str: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(buffer_str.contains("[Filter: \"frontend\"]"));
+        assert!(!buffer_str.contains("/frontend"));
     }
 }

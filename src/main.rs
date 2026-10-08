@@ -71,6 +71,8 @@ pub struct AppState {
     pub toasts: Vec<Toast>,
     pub table_state: TableState,
     pub spinner_tick: usize,
+    pub search_query: String,
+    pub is_searching: bool,
 }
 
 impl Default for AppState {
@@ -98,6 +100,8 @@ impl AppState {
             toasts: Vec::new(),
             table_state,
             spinner_tick: 0,
+            search_query: String::new(),
+            is_searching: false,
         }
     }
 
@@ -110,6 +114,113 @@ impl AppState {
 
     pub fn prune_toasts(&mut self) {
         self.toasts.retain(|t| !t.is_expired());
+    }
+
+    pub fn filter_services<'a>(services: &'a [Service], query: &str) -> Vec<&'a Service> {
+        let trimmed = query.trim().to_lowercase();
+        if trimmed.is_empty() {
+            return services.iter().collect();
+        }
+        services
+            .iter()
+            .filter(|s| {
+                s.short_name().to_lowercase().contains(&trimmed)
+                    || s.location()
+                        .map(|l| l.to_lowercase().contains(&trimmed))
+                        .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    pub fn filtered_services(&self) -> Vec<&Service> {
+        Self::filter_services(&self.services, &self.search_query)
+    }
+
+    pub fn clamp_selection(&mut self) {
+        let count = self.filtered_services().len();
+        if let Some(selected) = self.table_state.selected() {
+            if count == 0 {
+                if selected != 0 {
+                    self.table_state.select(Some(0));
+                }
+            } else if selected >= count {
+                self.table_state.select(Some(0));
+            }
+        } else {
+            self.table_state.select(Some(0));
+        }
+    }
+
+    pub fn handle_search_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => {
+                self.search_query.clear();
+                self.is_searching = false;
+                self.clamp_selection();
+            }
+            KeyCode::Enter => {
+                self.is_searching = false;
+            }
+            KeyCode::Backspace => {
+                self.search_query.pop();
+                self.clamp_selection();
+            }
+            KeyCode::Char(c) => {
+                self.search_query.push(c);
+                self.clamp_selection();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn navigate_down(&mut self) -> Option<String> {
+        self.clamp_selection();
+        let (i, svc_name) = {
+            let filtered = self.filtered_services();
+            let count = filtered.len();
+            if count == 0 {
+                (0, None)
+            } else {
+                let next_i = match self.table_state.selected() {
+                    Some(idx) => {
+                        if idx >= count.saturating_sub(1) {
+                            0
+                        } else {
+                            idx + 1
+                        }
+                    }
+                    None => 0,
+                };
+                (next_i, filtered.get(next_i).map(|s| s.short_name().to_string()))
+            }
+        };
+        self.table_state.select(Some(i));
+        svc_name
+    }
+
+    pub fn navigate_up(&mut self) -> Option<String> {
+        self.clamp_selection();
+        let (i, svc_name) = {
+            let filtered = self.filtered_services();
+            let count = filtered.len();
+            if count == 0 {
+                (0, None)
+            } else {
+                let prev_i = match self.table_state.selected() {
+                    Some(idx) => {
+                        if idx == 0 || idx >= count {
+                            count.saturating_sub(1)
+                        } else {
+                            idx - 1
+                        }
+                    }
+                    None => 0,
+                };
+                (prev_i, filtered.get(prev_i).map(|s| s.short_name().to_string()))
+            }
+        };
+        self.table_state.select(Some(i));
+        svc_name
     }
 
     pub fn dismiss_oldest_toast(&mut self) -> bool {
@@ -128,6 +239,7 @@ impl AppState {
                 self.is_fetching_services = false;
                 self.services_error = None;
                 self.is_auth_error = false;
+                self.clamp_selection();
                 if self.table_state.selected().is_none() && !self.services.is_empty() {
                     self.table_state.select(Some(0));
                 }
@@ -408,14 +520,36 @@ fn spawn_set_traffic_split(
     });
 }
 
-fn open_traffic_modal(
-    services: &[Service],
+trait AsService {
+    fn as_service(&self) -> &Service;
+}
+
+impl AsService for Service {
+    fn as_service(&self) -> &Service {
+        self
+    }
+}
+
+impl AsService for &Service {
+    fn as_service(&self) -> &Service {
+        self
+    }
+}
+
+impl AsService for &&Service {
+    fn as_service(&self) -> &Service {
+        self
+    }
+}
+
+fn open_traffic_modal<T: AsService>(
+    services: &[T],
     table_state: &TableState,
     client: &Arc<client::GcpClient>,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Option<TrafficModalState> {
     let idx = table_state.selected()?;
-    let svc = services.get(idx)?;
+    let svc = services.get(idx)?.as_service();
     let svc_name = svc.short_name().to_string();
 
     let mut modal = TrafficModalState::new(svc_name.clone(), svc.name.clone());
@@ -512,6 +646,8 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
 
         terminal.draw(|f| {
+            app_state.clamp_selection();
+            let filtered = AppState::filter_services(&app_state.services, &app_state.search_query);
             let banner_ref = app_state
                 .banner_message
                 .as_ref()
@@ -522,7 +658,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 UiState {
                     project,
                     region,
-                    services: &app_state.services,
+                    services: &filtered,
                     table_state: &mut app_state.table_state,
                     is_fetching_services: app_state.is_fetching_services,
                     services_error: app_state.services_error.as_deref(),
@@ -536,6 +672,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                     traffic_modal: app_state.traffic_modal.as_ref(),
                     toasts: &app_state.toasts,
                     spinner_tick: app_state.spinner_tick,
+                    search_query: &app_state.search_query,
+                    is_searching: app_state.is_searching,
                 },
             );
         })?;
@@ -566,8 +704,17 @@ async fn run_app<B: ratatui::backend::Backend>(
                 continue;
             }
 
+            // Search mode keystrokes take precedence over main view
+            if app_state.is_searching {
+                app_state.handle_search_key(key.code);
+                continue;
+            }
+
             // Main view interactions
             match key.code {
+                KeyCode::Char('/') => {
+                    app_state.is_searching = true;
+                }
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Esc => {
                     if app_state.banner_message.is_some() {
@@ -577,11 +724,16 @@ async fn run_app<B: ratatui::backend::Backend>(
                     } else if app_state.show_logs {
                         app_state.show_logs = false;
                         app_state.log_error_msg = None;
+                    } else if !app_state.search_query.is_empty() {
+                        app_state.search_query.clear();
+                        app_state.clamp_selection();
                     }
                 }
                 KeyCode::Char('s') => {
+                    app_state.clamp_selection();
+                    let filtered = app_state.filtered_services();
                     if let Some(modal) = open_traffic_modal(
-                        &app_state.services,
+                        &filtered,
                         &app_state.table_state,
                         &client,
                         &tx,
@@ -597,8 +749,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 KeyCode::Char('l') => {
+                    app_state.clamp_selection();
+                    let filtered = app_state.filtered_services();
                     if let Some(idx) = app_state.table_state.selected()
-                        && let Some(svc) = app_state.services.get(idx)
+                        && let Some(svc) = filtered.get(idx)
                     {
                         app_state.selected_service_name = svc.short_name().to_string();
                         app_state.show_logs = true;
@@ -629,31 +783,20 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 KeyCode::Char('o') => {
+                    app_state.clamp_selection();
+                    let filtered = app_state.filtered_services();
                     if let Some(idx) = app_state.table_state.selected()
-                        && let Some(svc) = app_state.services.get(idx)
+                        && let Some(svc) = filtered.get(idx)
                         && let Some(ref uri) = svc.uri
                     {
                         let _ = open::that(uri);
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    let i = match app_state.table_state.selected() {
-                        Some(i) => {
-                            if app_state.services.is_empty()
-                                || i >= app_state.services.len().saturating_sub(1)
-                            {
-                                0
-                            } else {
-                                i + 1
-                            }
-                        }
-                        None => 0,
-                    };
-                    app_state.table_state.select(Some(i));
-                    if app_state.show_logs
-                        && let Some(svc) = app_state.services.get(i)
+                    if let Some(svc_name) = app_state.navigate_down()
+                        && app_state.show_logs
                     {
-                        app_state.selected_service_name = svc.short_name().to_string();
+                        app_state.selected_service_name = svc_name;
                         app_state.logs.clear();
                         app_state.is_fetching_logs = true;
                         spawn_fetch_logs(
@@ -665,21 +808,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    let i = match app_state.table_state.selected() {
-                        Some(i) => {
-                            if i == 0 {
-                                app_state.services.len().saturating_sub(1)
-                            } else {
-                                i - 1
-                            }
-                        }
-                        None => 0,
-                    };
-                    app_state.table_state.select(Some(i));
-                    if app_state.show_logs
-                        && let Some(svc) = app_state.services.get(i)
+                    if let Some(svc_name) = app_state.navigate_up()
+                        && app_state.show_logs
                     {
-                        app_state.selected_service_name = svc.short_name().to_string();
+                        app_state.selected_service_name = svc_name;
                         app_state.logs.clear();
                         app_state.is_fetching_logs = true;
                         spawn_fetch_logs(
@@ -699,6 +831,163 @@ async fn run_app<B: ratatui::backend::Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_search_and_filtering() {
+        let mut state = AppState::new();
+        state.services = vec![
+            Service {
+                name: "projects/p/locations/us-central1/services/web-frontend".to_string(),
+                uri: Some("https://web.run.app".to_string()),
+                latest_ready_revision: Some("rev-1".to_string()),
+                conditions: None,
+                traffic_statuses: None,
+            },
+            Service {
+                name: "projects/p/locations/europe-west1/services/api-server".to_string(),
+                uri: Some("https://api.run.app".to_string()),
+                latest_ready_revision: Some("rev-2".to_string()),
+                conditions: None,
+                traffic_statuses: None,
+            },
+            Service {
+                name: "projects/p/locations/us-east1/services/worker-queue".to_string(),
+                uri: None,
+                latest_ready_revision: Some("rev-3".to_string()),
+                conditions: None,
+                traffic_statuses: None,
+            },
+        ];
+
+        // 1. Empty query returns all services
+        assert_eq!(state.filtered_services().len(), 3);
+
+        // 2. Case-insensitive match on short_name
+        state.search_query = "API".to_string();
+        let filtered = state.filtered_services();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].short_name(), "api-server");
+
+        state.search_query = "Frontend".to_string();
+        let filtered = state.filtered_services();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].short_name(), "web-frontend");
+
+        // 3. Case-insensitive match on location
+        state.search_query = "US-".to_string();
+        let filtered = state.filtered_services();
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].short_name(), "web-frontend");
+        assert_eq!(filtered[1].short_name(), "worker-queue");
+
+        state.search_query = "europe".to_string();
+        let filtered = state.filtered_services();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].short_name(), "api-server");
+
+        // 4. No matches
+        state.search_query = "nonexistent".to_string();
+        assert_eq!(state.filtered_services().len(), 0);
+    }
+
+    #[test]
+    fn test_search_key_handling_and_mode_transitions() {
+        let mut state = AppState::new();
+        state.services = vec![
+            Service {
+                name: "projects/p/locations/us-central1/services/alpha".to_string(),
+                uri: None,
+                latest_ready_revision: None,
+                conditions: None,
+                traffic_statuses: None,
+            },
+            Service {
+                name: "projects/p/locations/us-central1/services/beta".to_string(),
+                uri: None,
+                latest_ready_revision: None,
+                conditions: None,
+                traffic_statuses: None,
+            },
+        ];
+
+        // Activate searching
+        state.is_searching = true;
+
+        // Type characters
+        state.handle_search_key(KeyCode::Char('a'));
+        state.handle_search_key(KeyCode::Char('l'));
+        state.handle_search_key(KeyCode::Char('p'));
+        assert_eq!(state.search_query, "alp");
+        assert!(state.is_searching);
+        assert_eq!(state.filtered_services().len(), 1);
+
+        // Backspace deletes char
+        state.handle_search_key(KeyCode::Backspace);
+        assert_eq!(state.search_query, "al");
+        assert!(state.is_searching);
+
+        // Enter keeps query and exits search mode
+        state.handle_search_key(KeyCode::Enter);
+        assert_eq!(state.search_query, "al");
+        assert!(!state.is_searching);
+
+        // Reactivate and Esc clears query and exits search mode
+        state.is_searching = true;
+        state.handle_search_key(KeyCode::Esc);
+        assert_eq!(state.search_query, "");
+        assert!(!state.is_searching);
+        assert_eq!(state.filtered_services().len(), 2);
+    }
+
+    #[test]
+    fn test_clamping_and_navigation_on_filtered_services() {
+        let mut state = AppState::new();
+        state.services = vec![
+            Service {
+                name: "projects/p/locations/us-central1/services/svc-0".to_string(),
+                uri: None,
+                latest_ready_revision: None,
+                conditions: None,
+                traffic_statuses: None,
+            },
+            Service {
+                name: "projects/p/locations/us-central1/services/svc-1".to_string(),
+                uri: None,
+                latest_ready_revision: None,
+                conditions: None,
+                traffic_statuses: None,
+            },
+            Service {
+                name: "projects/p/locations/us-central1/services/svc-2".to_string(),
+                uri: None,
+                latest_ready_revision: None,
+                conditions: None,
+                traffic_statuses: None,
+            },
+        ];
+
+        // Select last index (2)
+        state.table_state.select(Some(2));
+
+        // Filter down so only 1 service matches (index 0)
+        state.search_query = "svc-0".to_string();
+        state.clamp_selection();
+        // Index 2 shrank past filtered length (1), reset to 0
+        assert_eq!(state.table_state.selected(), Some(0));
+
+        // Navigation wraps around filtered list
+        state.search_query = "".to_string();
+        state.table_state.select(Some(0));
+        assert_eq!(state.navigate_down(), Some("svc-1".to_string()));
+        assert_eq!(state.table_state.selected(), Some(1));
+        assert_eq!(state.navigate_down(), Some("svc-2".to_string()));
+        assert_eq!(state.table_state.selected(), Some(2));
+        assert_eq!(state.navigate_down(), Some("svc-0".to_string())); // wrap to 0
+        assert_eq!(state.table_state.selected(), Some(0));
+
+        assert_eq!(state.navigate_up(), Some("svc-2".to_string())); // wrap to 2
+        assert_eq!(state.table_state.selected(), Some(2));
+    }
 
     #[test]
     fn test_app_state_initial() {
