@@ -81,11 +81,14 @@ struct TokenCache {
     fetched_at: Instant,
 }
 
+type TokenProvider = Arc<dyn Fn() -> Result<String> + Send + Sync>;
+
 pub struct GcpClient {
     client: reqwest::Client,
     project_id: String,
     region: String,
     token_cache: Arc<RwLock<Option<TokenCache>>>,
+    token_provider: Option<TokenProvider>,
     run_base_url: String,
     logging_base_url: String,
 }
@@ -116,6 +119,7 @@ impl GcpClient {
             project_id,
             region,
             token_cache: Arc::new(RwLock::new(None)),
+            token_provider: None,
             run_base_url: run_base_url.trim_end_matches('/').to_string(),
             logging_base_url: logging_base_url.trim_end_matches('/').to_string(),
         })
@@ -137,6 +141,20 @@ impl GcpClient {
             fetched_at: Instant::now(),
         })));
         self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_token_provider<F>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> Result<String> + Send + Sync + 'static,
+    {
+        self.token_provider = Some(Arc::new(provider));
+        self
+    }
+
+    pub async fn invalidate_token(&self) {
+        let mut cache = self.token_cache.write().await;
+        *cache = None;
     }
 
     #[allow(dead_code)]
@@ -163,9 +181,13 @@ impl GcpClient {
             return Ok(c.token.clone());
         }
 
-        let new_token = tokio::task::spawn_blocking(Self::fetch_access_token)
-            .await
-            .context("Failed to join gcloud execution thread")??;
+        let new_token = if let Some(ref provider) = self.token_provider {
+            provider()?
+        } else {
+            tokio::task::spawn_blocking(Self::fetch_access_token)
+                .await
+                .context("Failed to join gcloud execution thread")??
+        };
 
         *cache = Some(TokenCache {
             token: new_token.clone(),
@@ -188,7 +210,7 @@ impl GcpClient {
 
         let output = cmd.output().map_err(|e| {
             anyhow::anyhow!(
-                "Failed to execute 'gcloud' CLI: {}. Please ensure Google Cloud SDK is installed and 'gcloud' is in your PATH.",
+                "Failed to execute 'gcloud' CLI: {}. Please ensure Google Cloud SDK is installed and 'gcloud' is in your PATH. Please run 'gcloud auth login' to authenticate.",
                 e
             )
         })?;
@@ -218,18 +240,29 @@ impl GcpClient {
     }
 
     pub async fn list_services(&self) -> Result<Vec<Service>> {
-        let token = self.get_valid_token().await?;
         let url = format!(
             "{}/v2/projects/{}/locations/{}/services",
             self.run_base_url, self.project_id, self.region
         );
 
-        let resp = self
+        let mut token = self.get_valid_token().await?;
+        let mut resp = self
             .client
             .get(&url)
             .header(AUTHORIZATION, format!("Bearer {}", token))
             .send()
             .await?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.invalidate_token().await;
+            token = self.get_valid_token().await?;
+            resp = self
+                .client
+                .get(&url)
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .send()
+                .await?;
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -242,7 +275,6 @@ impl GcpClient {
     }
 
     pub async fn fetch_recent_logs(&self, service_name: &str) -> Result<Vec<LogEntry>> {
-        let token = self.get_valid_token().await?;
         let url = format!("{}/v2/entries:list", self.logging_base_url);
 
         let filter = format!(
@@ -258,13 +290,26 @@ impl GcpClient {
             "pageSize": 50
         });
 
-        let resp = self
+        let mut token = self.get_valid_token().await?;
+        let mut resp = self
             .client
             .post(&url)
             .header(AUTHORIZATION, format!("Bearer {}", token))
             .json(&body)
             .send()
             .await?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.invalidate_token().await;
+            token = self.get_valid_token().await?;
+            resp = self
+                .client
+                .post(&url)
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .json(&body)
+                .send()
+                .await?;
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -276,6 +321,11 @@ impl GcpClient {
         let mut entries = parsed.entries.unwrap_or_default();
         entries.reverse();
         Ok(entries)
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_logs(&self, service_name: &str) -> Result<Vec<LogEntry>> {
+        self.fetch_recent_logs(service_name).await
     }
 
     pub async fn list_revisions(&self, service_name: &str, location: &str) -> Result<Vec<Revision>> {
@@ -312,18 +362,29 @@ impl GcpClient {
             service_name.rsplit('/').next().unwrap_or(service_name)
         };
 
-        let token = self.get_valid_token().await?;
         let url = format!(
             "{}/v2/projects/{}/locations/{}/services/{}/revisions",
             self.run_base_url, proj, loc, clean_service_name
         );
 
-        let resp = self
+        let mut token = self.get_valid_token().await?;
+        let mut resp = self
             .client
             .get(&url)
             .header(AUTHORIZATION, format!("Bearer {}", token))
             .send()
             .await?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.invalidate_token().await;
+            token = self.get_valid_token().await?;
+            resp = self
+                .client
+                .get(&url)
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .send()
+                .await?;
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -365,7 +426,6 @@ impl GcpClient {
             service_name.rsplit('/').next().unwrap_or(service_name)
         };
 
-        let token = self.get_valid_token().await?;
         let url = format!(
             "{}/v2/projects/{}/locations/{}/services/{}?updateMask=traffic",
             self.run_base_url, proj, loc, clean_service_name
@@ -390,13 +450,26 @@ impl GcpClient {
             "traffic": traffic_array
         });
 
-        let resp = self
+        let mut token = self.get_valid_token().await?;
+        let mut resp = self
             .client
             .patch(&url)
             .header(AUTHORIZATION, format!("Bearer {}", token))
             .json(&body)
             .send()
             .await?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            self.invalidate_token().await;
+            token = self.get_valid_token().await?;
+            resp = self
+                .client
+                .patch(&url)
+                .header(AUTHORIZATION, format!("Bearer {}", token))
+                .json(&body)
+                .send()
+                .await?;
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -416,6 +489,16 @@ impl GcpClient {
     ) -> Result<()> {
         let with_tags = splits.into_iter().map(|(rev, pct)| (rev, pct, None)).collect();
         self.set_traffic_split_with_tags(service_name, with_tags).await
+    }
+
+    /// Update traffic split allocation via Cloud Run Admin v2 API
+    #[allow(dead_code)]
+    pub async fn set_traffic(
+        &self,
+        service_name: &str,
+        splits: Vec<(&str, i32)>,
+    ) -> Result<()> {
+        self.set_traffic_split(service_name, splits).await
     }
 }
 
@@ -934,5 +1017,234 @@ mod tests {
         assert!(err_msg.contains("Permission Denied"));
         assert!(err_msg.contains("Cloud Run Developer"));
         assert!(err_msg.contains("Caller lacks run.services.update permission"));
+    }
+    #[tokio::test]
+    async fn test_invalidate_token_clears_cache() {
+        let client = GcpClient::with_base_urls(
+            "test-project".to_string(),
+            "us-central1".to_string(),
+            "http://localhost".to_string(),
+            "http://localhost".to_string(),
+        )
+        .unwrap()
+        .with_token("initial-token");
+
+        assert_eq!(client.get_valid_token().await.unwrap(), "initial-token");
+        client.invalidate_token().await;
+
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let client = client.with_token_provider(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("refreshed-token".to_string())
+        });
+        assert_eq!(client.get_valid_token().await.unwrap(), "refreshed-token");
+    }
+
+    #[tokio::test]
+    async fn test_list_services_unauthorized_retries_and_succeeds() {
+        let server = MockServer::start().await;
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc = call_count.clone();
+
+        let client = GcpClient::with_base_urls(
+            "test-project".to_string(),
+            "us-central1".to_string(),
+            server.uri(),
+            server.uri(),
+        )
+        .unwrap()
+        .with_token("expired-token")
+        .with_token_provider(move || {
+            cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("fresh-token".to_string())
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/v2/projects/test-project/locations/us-central1/services"))
+            .and(header("Authorization", "Bearer expired-token"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Expired token"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/projects/test-project/locations/us-central1/services"))
+            .and(header("Authorization", "Bearer fresh-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "services": [
+                    {
+                        "name": "projects/test-project/locations/us-central1/services/my-api"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let services = client.list_services().await.expect("Expected retry to succeed");
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].short_name(), "my-api");
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_services_unauthorized_fails_after_single_retry() {
+        let server = MockServer::start().await;
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc = call_count.clone();
+
+        let client = GcpClient::with_base_urls(
+            "test-project".to_string(),
+            "us-central1".to_string(),
+            server.uri(),
+            server.uri(),
+        )
+        .unwrap()
+        .with_token("expired-token")
+        .with_token_provider(move || {
+            cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("still-unauthorized-token".to_string())
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/v2/projects/test-project/locations/us-central1/services"))
+            .and(header("Authorization", "Bearer expired-token"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Expired token"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/projects/test-project/locations/us-central1/services"))
+            .and(header("Authorization", "Bearer still-unauthorized-token"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Still unauthorized"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client.list_services().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("401"));
+        assert!(err.contains("gcloud auth login"));
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_revisions_unauthorized_retries_and_succeeds() {
+        let server = MockServer::start().await;
+        let client = GcpClient::with_base_urls(
+            "test-project".to_string(),
+            "us-central1".to_string(),
+            server.uri(),
+            server.uri(),
+        )
+        .unwrap()
+        .with_token("expired-token")
+        .with_token_provider(|| Ok("fresh-token".to_string()));
+
+        Mock::given(method("GET"))
+            .and(path("/v2/projects/test-project/locations/us-central1/services/web/revisions"))
+            .and(header("Authorization", "Bearer expired-token"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/projects/test-project/locations/us-central1/services/web/revisions"))
+            .and(header("Authorization", "Bearer fresh-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "revisions": [
+                    {
+                        "name": "projects/test-project/locations/us-central1/services/web/revisions/web-001"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let revs = client.list_revisions("web", "us-central1").await.expect("Expected retry to succeed");
+        assert_eq!(revs.len(), 1);
+        assert_eq!(revs[0].short_name(), "web-001");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_recent_logs_unauthorized_retries_and_succeeds() {
+        let server = MockServer::start().await;
+        let client = GcpClient::with_base_urls(
+            "test-project".to_string(),
+            "us-central1".to_string(),
+            server.uri(),
+            server.uri(),
+        )
+        .unwrap()
+        .with_token("expired-token")
+        .with_token_provider(|| Ok("fresh-token".to_string()));
+
+        Mock::given(method("POST"))
+            .and(path("/v2/entries:list"))
+            .and(header("Authorization", "Bearer expired-token"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v2/entries:list"))
+            .and(header("Authorization", "Bearer fresh-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "entries": [
+                    {
+                        "textPayload": "Test log output",
+                        "severity": "INFO",
+                        "timestamp": "2024-01-01T00:00:00Z"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let logs = client.get_logs("web").await.expect("Expected get_logs retry to succeed");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].message().unwrap(), "Test log output");
+    }
+
+    #[tokio::test]
+    async fn test_set_traffic_unauthorized_retries_and_succeeds() {
+        let server = MockServer::start().await;
+        let client = GcpClient::with_base_urls(
+            "test-project".to_string(),
+            "us-central1".to_string(),
+            server.uri(),
+            server.uri(),
+        )
+        .unwrap()
+        .with_token("expired-token")
+        .with_token_provider(|| Ok("fresh-token".to_string()));
+
+        Mock::given(method("PATCH"))
+            .and(path("/v2/projects/test-project/locations/us-central1/services/web"))
+            .and(query_param("updateMask", "traffic"))
+            .and(header("Authorization", "Bearer expired-token"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path("/v2/projects/test-project/locations/us-central1/services/web"))
+            .and(query_param("updateMask", "traffic"))
+            .and(header("Authorization", "Bearer fresh-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let splits = vec![("web-001", 100)];
+        let res = client.set_traffic("web", splits).await;
+        assert!(res.is_ok());
     }
 }

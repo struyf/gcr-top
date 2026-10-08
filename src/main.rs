@@ -294,6 +294,13 @@ impl AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+        original_hook(panic_info);
+    }));
+
     let args = Args::parse();
     let client = Arc::new(client::GcpClient::new(args.project.clone(), args.region.clone())?);
 
