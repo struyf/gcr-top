@@ -23,11 +23,12 @@ jobs:
           persist-credentials: false
 
       - name: "Run analysis"
-        uses: ossf/scorecard-action@f49aab0b5ae4220a798738202d9522b0f56728d7
+        uses: ossf/scorecard-action@v2.4.4
         with:
           results_file: results.sarif
           results_format: sarif
           publish_results: true
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: "Upload to code-scanning"
         uses: github/codeql-action/upload-sarif@v3
