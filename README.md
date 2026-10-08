@@ -1,5 +1,5 @@
 # gcr-top
-
+[![Crates.io](https://img.shields.io/crates/v/gcr-top.svg?style=flat-square)](https://crates.io/crates/gcr-top)
 [![Release](https://img.shields.io/github/v/release/struyf/gcr-top?style=flat-square)](https://github.com/struyf/gcr-top/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
 
@@ -30,6 +30,12 @@ Extract the archive and move the binary to a directory in your $PATH:
 
 tar -xzf gcr-top-v1.0.0-x86_64-unknown-linux-gnu.tar.gz
 sudo mv gcr-top /usr/local/bin/
+
+### Via Cargo (Crates.io)
+
+```bash
+cargo install gcr-top
+```
 
 ### From source (via Cargo)
 
