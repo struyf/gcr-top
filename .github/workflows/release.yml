@@ -28,6 +28,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             use_cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
 
     steps:
       - name: Checkout repository
@@ -43,6 +46,7 @@ jobs:
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build release binary
+        shell: bash
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
             cross build --release --target ${{ matrix.target }}
@@ -50,7 +54,8 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
 
-      - name: Package archive
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           STAGING="gcr-top-${{ github.ref_name }}-${{ matrix.target }}"
@@ -59,6 +64,17 @@ jobs:
           cp README.md LICENSE "$STAGING/" 2>/dev/null || true
           tar czvf "${STAGING}.tar.gz" -C "$STAGING" .
           echo "ASSET_PATH=${STAGING}.tar.gz" >> $GITHUB_ENV
+
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          STAGING="gcr-top-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$STAGING"
+          cp "target/${{ matrix.target }}/release/gcr-top.exe" "$STAGING/"
+          cp README.md LICENSE "$STAGING/" 2>/dev/null || true
+          tar -a -c -f "${STAGING}.zip" -C "$STAGING" *
+          echo "ASSET_PATH=${STAGING}.zip" >> $GITHUB_ENV
 
       - name: Upload artifact to GitHub Release
         uses: softprops/action-gh-release@v2
