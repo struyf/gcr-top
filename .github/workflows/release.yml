@@ -67,14 +67,15 @@ jobs:
 
       - name: Package archive (Windows)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          STAGING="gcr-top-${{ github.ref_name }}-${{ matrix.target }}"
-          mkdir -p "$STAGING"
-          cp "target/${{ matrix.target }}/release/gcr-top.exe" "$STAGING/"
-          cp README.md LICENSE "$STAGING/" 2>/dev/null || true
-          tar -a -c -f "${STAGING}.zip" -C "$STAGING" *
-          echo "ASSET_PATH=${STAGING}.zip" >> $GITHUB_ENV
+          $staging = "gcr-top-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $staging -Force
+          Copy-Item "target/${{ matrix.target }}/release/gcr-top.exe" -Destination "$staging/"
+          if (Test-Path README.md) { Copy-Item README.md -Destination "$staging/" }
+          if (Test-Path LICENSE) { Copy-Item LICENSE -Destination "$staging/" }
+          Compress-Archive -Path "$staging/*" -DestinationPath "${staging}.zip" -Force
+          "ASSET_PATH=${staging}.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload artifact to GitHub Release
         uses: softprops/action-gh-release@v2
