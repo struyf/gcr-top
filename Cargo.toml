@@ -9,6 +9,12 @@ repository = "https://github.com/struyf/gcr-top"
 readme = "README.md"
 keywords = ["google-cloud", "cloud-run", "tui", "ratatui", "monitoring"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    ".github",
+    ".gitignore",
+    ".vscode",
+    "tests/fixtures",
+]
 
 [dependencies]
 # Terminal UI & Event handling
