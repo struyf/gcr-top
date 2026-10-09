@@ -27,9 +27,10 @@ Download the latest release binary for your platform from the GitHub Releases pa
 * Windows (x86_64)
 
 Extract the archive and move the binary to a directory in your $PATH:
-
-tar -xzf gcr-top-v1.0.0-x86_64-unknown-linux-gnu.tar.gz
+```bash
+tar -xzf gcr-top-v1.0.2-x86_64-unknown-linux-gnu.tar.gz
 sudo mv gcr-top /usr/local/bin/
+```
 
 ### Via Cargo (Crates.io)
 
@@ -40,17 +41,19 @@ cargo install gcr-top
 ### From source (via Cargo)
 
 Ensure you have Rust and Cargo installed (>= 1.75 recommended):
-
+```bash
 git clone https://github.com/struyf/gcr-top.git
 cd gcr-top
 cargo build --release
 sudo cp target/release/gcr-top /usr/local/bin/
+```
 
 ## Authentication & Prerequisites
 
 gcr-top uses standard Google Cloud Application Default Credentials (ADC). Ensure you are logged in with adequate permissions:
-
+```bash
 gcloud auth application-default login
+```
 
 ## Usage
 
@@ -58,15 +61,17 @@ gcloud auth application-default login
 
 Launch gcr-top by providing your Google Cloud Project ID:
 
+```bash
 gcr-top --project my-gcp-project-id
 gcr-top --project $(gcloud config get-value project)
+```
 
 ### Multi-Region Aggregation
 
 To fetch services deployed across all regions simultaneously:
-
+```bash
 gcr-top --project $(gcloud config get-value project) --region -
-
+```
 ## Keyboard Navigation
 
 * Up / Down or k / j: Navigate through services list
